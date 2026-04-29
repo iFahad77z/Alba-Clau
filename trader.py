@@ -55,8 +55,6 @@ WATCHLIST = [
     ('TXN',     False),
     ('CVX',     False),
     ('XOM',     False),
-    ('GOLD',    False),
-    ('SLV',     False),
     ('GLW',     False),
     ('BTC/USD', True),
 ]
