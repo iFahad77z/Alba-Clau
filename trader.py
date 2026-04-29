@@ -192,11 +192,28 @@ def run():
         a14 = atr(highs, lows, closes, ATR_PERIOD)
         if e9[n] is None or e21[n] is None or a14 is None:
             continue
-        vol_avg = sum(vols[n - VOL_LOOKBACK:n]) / VOL_LOOKBACK if n >= VOL_LOOKBACK else 0
-        vol_mult = vols[n] / vol_avg if vol_avg > 0 else 0
-        bull = e9[n - 1] <= e21[n - 1] and e9[n] > e21[n]
-        bear = e9[n - 1] >= e21[n - 1] and e9[n] < e21[n]
         price = closes[n]
+
+        # Detect cross within last 2 bars (n-2 -> n-1 OR n-1 -> n) to handle cron-vs-bar-close timing
+        bull = False
+        bear = False
+        cross_bar = n
+        for k in (0, 1):
+            cur, prv = n - k, n - k - 1
+            if prv < 0:
+                break
+            if not bull and e9[prv] <= e21[prv] and e9[cur] > e21[cur]:
+                bull, cross_bar = True, cur
+            if not bear and e9[prv] >= e21[prv] and e9[cur] < e21[cur]:
+                bear, cross_bar = True, cur
+            if bull or bear:
+                break
+
+        vol_bar = cross_bar if (bull or bear) else n
+        vol_start = max(0, vol_bar - VOL_LOOKBACK)
+        vol_window = vols[vol_start:vol_bar]
+        vol_avg = sum(vol_window) / len(vol_window) if vol_window else 0
+        vol_mult = vols[vol_bar] / vol_avg if vol_avg > 0 else 0
 
         if sym in state:
             pos = state[sym]
