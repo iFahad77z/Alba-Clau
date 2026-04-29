@@ -7,7 +7,7 @@ on:
   workflow_dispatch:  # allow manual triggering
 
 permissions:
-  contents: write  # needed to commit v2_state.json back
+  contents: write  # needed to commit scalper_state.json back
 
 concurrency:
   group: trader
@@ -32,12 +32,12 @@ jobs:
           ALPACA_SECRET: ${{ secrets.ALPACA_SECRET }}
         run: python trader.py | tee -a run.log
 
-      - name: Persist v2 state
+      - name: Persist scalper state
         run: |
-          if [[ -n "$(git status --porcelain v2_state.json)" ]]; then
+          if [[ -n "$(git status --porcelain scalper_state.json)" ]]; then
             git config user.name "trader-bot"
             git config user.email "trader-bot@users.noreply.github.com"
-            git add v2_state.json
+            git add scalper_state.json
             git commit -m "v2 state update [skip ci]"
             git push
           fi
