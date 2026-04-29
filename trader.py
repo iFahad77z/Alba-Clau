@@ -174,6 +174,19 @@ def save_state(state):
 
 def run():
     log('=== Scalper LIVE tick ===')
+    # Time-based gating (UTC; US market hours during DST: 13:30-20:00 UTC)
+    now_utc = datetime.now(timezone.utc)
+    utc_min = now_utc.hour * 60 + now_utc.minute
+    market_open_min = 13 * 60 + 30
+    market_close_min = 20 * 60
+    no_entry_after_min = market_close_min - 60
+    force_close_at_min = market_close_min - 30
+    is_weekend = now_utc.weekday() >= 5
+    market_open = (not is_weekend) and market_open_min <= utc_min < market_close_min
+    block_new_stock_entries = (not market_open) or utc_min >= no_entry_after_min
+    force_close_stocks = (not is_weekend) and force_close_at_min <= utc_min < market_close_min
+    log(f"Time: UTC={now_utc:%H:%M} marketOpen={market_open} blockStockEntries={block_new_stock_entries} forceCloseStocks={force_close_stocks}")
+
     state = load_state()
     open_symbol = next(iter(state), None)
 
@@ -220,7 +233,9 @@ def run():
             entry = pos['entry']
             stop = pos['stop']
             should_exit, reason = False, ''
-            if price <= stop:
+            if (not is_crypto) and force_close_stocks:
+                should_exit, reason = True, 'FORCE CLOSE (30 min before market close)'
+            elif price <= stop:
                 should_exit, reason = True, f'STOP HIT (price={price:.4f} <= stop={stop:.4f})'
             elif bear:
                 should_exit, reason = True, f'EMA BEAR CROSS (9={e9[n]:.4f} <= 21={e21[n]:.4f})'
@@ -233,7 +248,7 @@ def run():
             else:
                 pl_pct = (price - entry) / entry * 100
                 log(f'HOLD {sym}: price={price:.4f} entry={entry:.4f} stop={stop:.4f} estP/L={pl_pct:.2f}%')
-        elif open_symbol is None and bull and vol_mult >= VOL_MULT and a14 > 0:
+        elif open_symbol is None and bull and vol_mult >= VOL_MULT and a14 > 0 and (is_crypto or not block_new_stock_entries):
             stop_price = price - ATR_MULT * a14
             acct = get_account()
             if not acct:
