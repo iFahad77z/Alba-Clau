@@ -268,7 +268,7 @@ def process_exit(strat, state, bars_dict, force_close_stocks):
         log(f'[{strat}] HOLD {sym}: price={price:.4f} entry={entry:.4f} stop={stop:.4f} estP/L={pl_pct:+.2f}%')
 
 
-def process_entry(strat, state, bars_dict, taken_syms, per_strategy_target, block_new_stock_entries):
+def process_entry(strat, state, bars_dict, taken_syms, per_strategy_target, block_new_stock_entries, market_open):
     if state.get(strat):
         return  # already holding
 
@@ -297,14 +297,17 @@ def process_entry(strat, state, bars_dict, taken_syms, per_strategy_target, bloc
             sig = signal_ema(bars, f, s)
             if not sig or not sig['bull_cross']:
                 continue
-            # Volume filter for stocks (not crypto)
-            if not is_crypto:
+            # Volume filter: apply to ALL symbols (including BTC) when US market is open.
+            # When market is closed, BTC entries skip the volume filter (Alpaca crypto
+            # data feed is unreliable off-hours and would otherwise reject all signals).
+            apply_vol_filter = (not is_crypto) or market_open
+            if apply_vol_filter:
                 vm = vol_mult(bars)
                 if vm < VOL_MULT_STOCKS:
                     continue
                 details = f"{f}/{s} EMA bull cross + vol {vm:.2f}x | {f}EMA={sig['fast_now']:.4f} {s}EMA={sig['slow_now']:.4f}"
             else:
-                details = f"{f}/{s} EMA bull cross (BTC, no vol filter) | {f}EMA={sig['fast_now']:.4f} {s}EMA={sig['slow_now']:.4f}"
+                details = f"{f}/{s} EMA bull cross (BTC off-hours, no vol filter) | {f}EMA={sig['fast_now']:.4f} {s}EMA={sig['slow_now']:.4f}"
             fired = True
 
         elif strat == 'C':
@@ -385,7 +388,7 @@ def run():
 
     # Entries
     for s in ('A', 'B', 'C'):
-        process_entry(s, state, bars_dict, taken_syms, per_strategy_target, block_new_stock_entries)
+        process_entry(s, state, bars_dict, taken_syms, per_strategy_target, block_new_stock_entries, market_open)
 
     save_state(state)
 
