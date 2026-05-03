@@ -264,7 +264,7 @@ def run():
             else:
                 pl_pct = (price - entry) / entry * 100
                 log(f'HOLD {sym}: price={price:.4f} entry={entry:.4f} stop={stop:.4f} estP/L={pl_pct:.2f}%')
-        elif open_symbol is None and bull and vol_mult >= VOL_MULT and a14 > 0 and (is_crypto or not block_new_stock_entries):
+        elif open_symbol is None and bull and (is_crypto or vol_mult >= VOL_MULT) and a14 > 0 and (is_crypto or not block_new_stock_entries):
             stop_price = price - ATR_MULT * a14
             acct = get_account()
             if not acct:
