@@ -55,6 +55,19 @@ ORB_BARS = 6  # first 6 x 5-min bars = first 30 min of session
 
 ALL_STRATS = ('A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J')
 
+STRAT_NAMES = {
+    'A': 'Fast EMA Cross (9/21)',
+    'B': 'Slow EMA Cross (50/200)',
+    'C': 'Donchian Breakout (20/10)',
+    'D': 'MACD (12/26/9)',
+    'E': 'Bollinger Reversion (20, 2σ)',
+    'F': 'RSI Bounce (14)',
+    'G': 'SuperTrend (10, 3.0)',
+    'H': 'Opening Range Breakout',
+    'I': 'VWAP Reclaim',
+    'J': 'Inside Bar Breakout',
+}
+
 WATCHLIST = [
     ('GOOGL', False), ('AMZN', False), ('MSFT', False), ('NVDA', False),
     ('CF', False), ('NVO', False), ('AMD', False), ('AAPL', False),
@@ -604,7 +617,7 @@ def process_exit(strat, state, bars_dict, force_close_stocks):
             close_position(sym, qty=pos['qty'])
         else:
             close_position(sym)
-        tg(f"[{strat}] SELL {sym}\nReason: {reason}\nEntry: ${entry:.4f}\nExit (approx): ${price:.4f}\nEst P/L: {pl_pct:+.2f}%")
+        tg(f"SELL {sym}\nStrategy [{strat}]: {STRAT_NAMES[strat]}\nReason: {reason}\nEntry: ${entry:.4f}\nExit (approx): ${price:.4f}\nEst P/L: {pl_pct:+.2f}%")
         state[strat] = None
     else:
         pl_pct = (price - entry) / entry * 100
@@ -671,7 +684,7 @@ def process_entry(strat, state, bars_dict, taken_syms, per_strategy_target,
                 'qty': order.get('qty') or order.get('filled_qty'),
             }
             taken_syms.add(sym)
-            tg(f"[{strat}] BUY {sym} @ ${price:.4f}\nReason: {details}\nATR(14): {a14:.4f}\nStop: ${stop_price:.4f}\nNotional: ${notional:.2f}")
+            tg(f"BUY {sym} @ ${price:.4f}\nStrategy [{strat}]: {STRAT_NAMES[strat]}\nReason: {details}\nATR(14): {a14:.4f}\nStop: ${stop_price:.4f}\nNotional: ${notional:.2f}")
             return  # one entry per strategy per tick
 
 
