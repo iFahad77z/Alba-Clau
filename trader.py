@@ -11,6 +11,8 @@ import requests
 
 KEY = os.environ['ALPACA_KEY']
 SECRET = os.environ['ALPACA_SECRET']
+TG_TOKEN = os.environ.get('TG_TOKEN', '')
+TG_CHAT_ID = os.environ.get('TG_CHAT_ID', '')
 
 TRADE_BASE = 'https://paper-api.alpaca.markets/v2'
 DATA_STOCKS = 'https://data.alpaca.markets/v2/stocks/bars'
@@ -63,6 +65,19 @@ WATCHLIST = [
 def log(msg: str) -> None:
     ts = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%SZ')
     print(f'[{ts}] {msg}', flush=True)
+
+
+def tg(msg: str) -> None:
+    if not TG_TOKEN or not TG_CHAT_ID:
+        return
+    try:
+        requests.get(
+            f'https://api.telegram.org/bot{TG_TOKEN}/sendMessage',
+            params={'chat_id': TG_CHAT_ID, 'text': msg},
+            timeout=10,
+        )
+    except Exception as e:
+        log(f'TG send failed: {e}')
 
 
 def get_bars(symbol: str, is_crypto: bool):
@@ -243,6 +258,7 @@ def run():
                 pl_pct = (price - entry) / entry * 100
                 log(f'EXIT {sym}: {reason} | entry={entry:.4f} exit~{price:.4f} estP/L={pl_pct:.2f}%')
                 close_position(sym)
+                tg(f"SELL {sym}\nReason: {reason}\nEntry: ${entry:.4f}\nExit (approx): ${price:.4f}\nEst P/L: {pl_pct:+.2f}%")
                 del state[sym]
                 open_symbol = None
             else:
@@ -265,6 +281,8 @@ def run():
                     'order_id': order['id'],
                 }
                 open_symbol = sym
+                notional = round(cash * CASH_PCT, 2)
+                tg(f"BUY {sym} @ ${price:.4f}\nReason: 9/21 EMA bull cross + vol {vol_mult:.2f}x\n9 EMA: {e9[n]:.4f}\n21 EMA: {e21[n]:.4f}\nATR(14): {a14:.4f}\nStop: ${stop_price:.4f}\nNotional: ${notional}\nCash before: ${cash:.2f}")
 
     save_state(state)
 
