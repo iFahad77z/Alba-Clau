@@ -38,7 +38,15 @@ STATE_PATH = Path('scalper_state.json')
 ATR_PERIOD = 14
 ATR_MULT = 1.5
 CASH_PCT = 0.99
-VOL_MULT_THRESHOLD = 1.0
+VOL_MULT_THRESHOLD = 1.0  # default for strategies that don't override
+VOL_MULT_PER_STRAT = {
+    'A': 1.0,
+    'B': 0.5,  # 50/200 EMA fires rarely; loosen volume filter to actually catch the rare crosses
+    'D': 1.0,
+    'G': 1.0,
+    'H': 1.0,
+    'J': 1.0,
+}
 VOL_LOOKBACK = 20
 
 DONCHIAN_PERIOD = 20
@@ -657,7 +665,8 @@ def process_entry(strat, state, bars_dict, taken_syms, per_strategy_target,
             apply_vol = (not is_crypto) or market_open
             if apply_vol:
                 vm = vol_mult(bars)
-                if vm < VOL_MULT_THRESHOLD:
+                threshold = VOL_MULT_PER_STRAT.get(strat, VOL_MULT_THRESHOLD)
+                if vm < threshold:
                     continue
                 details += f" + vol {vm:.2f}x"
 
