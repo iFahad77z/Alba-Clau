@@ -158,6 +158,33 @@ def get_account():
         return None
 
 
+def get_alpaca_positions():
+    """Returns dict of {symbol: position_dict}. BTCUSD normalized to BTC/USD."""
+    try:
+        r = requests.get(f'{TRADE_BASE}/positions', headers=HEADERS, timeout=15)
+        r.raise_for_status()
+        out = {}
+        for p in r.json():
+            sym = p.get('symbol', '')
+            if sym == 'BTCUSD':
+                sym = 'BTC/USD'
+            out[sym] = p
+        return out
+    except Exception as e:
+        log(f'ERROR positions: {e}')
+        return {}
+
+
+def sync_state_with_alpaca(state):
+    """Drop any state entries for positions that no longer exist on Alpaca (manual closes etc.)."""
+    alpaca_syms = set(get_alpaca_positions().keys())
+    for s in ALL_STRATS:
+        pos = state.get(s)
+        if pos and pos.get('symbol') not in alpaca_syms:
+            log(f'[{s}] STATE SYNC: {pos["symbol"]} no longer on Alpaca, clearing slot')
+            state[s] = None
+
+
 def buy_notional(symbol, notional, is_crypto):
     body = {
         'symbol': symbol,
@@ -679,9 +706,16 @@ def process_entry(strat, state, bars_dict, taken_syms, per_strategy_target,
         if not acct:
             continue
         cash = float(acct['cash'])
-        notional = min(per_strategy_target, cash * CASH_PCT)
+        # Use non_marginable_buying_power to prevent the bot from using margin.
+        # Falls back to cash if not present (some account types).
+        nmbp = float(acct.get('non_marginable_buying_power', cash))
+        available = min(cash, nmbp)
+        if available < 1:
+            log(f'[{strat}] BUY SKIPPED {sym}: no non-margin cash (cash=${cash:.2f}, non_margin_bp=${nmbp:.2f})')
+            continue
+        notional = min(per_strategy_target, available * CASH_PCT)
         if notional < 1:
-            log(f'[{strat}] BUY SKIPPED {sym}: insufficient cash (${cash:.2f})')
+            log(f'[{strat}] BUY SKIPPED {sym}: insufficient cash (${available:.2f})')
             continue
 
         stop_price = price - ATR_MULT * a14
@@ -719,6 +753,7 @@ def run():
     log(f'Time: UTC={now_utc:%H:%M} marketOpen={market_open} blockStockEntries={block_new_stock_entries} forceCloseStocks={force_close_stocks}')
 
     state = load_state()
+    sync_state_with_alpaca(state)
 
     acct = get_account()
     if not acct:
