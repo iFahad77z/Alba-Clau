@@ -625,7 +625,12 @@ def process_exit(strat, state, bars_dict, force_close_stocks):
             close_position(sym, qty=pos['qty'])
         else:
             close_position(sym)
-        tg(f"SELL {sym}\nStrategy [{strat}]: {STRAT_NAMES[strat]}\nReason: {reason}\nEntry: ${entry:.4f}\nExit (approx): ${price:.4f}\nEst P/L: {pl_pct:+.2f}%")
+        notional_in = pos.get('notional')
+        est_pl_dollars = (notional_in * pl_pct / 100) if notional_in else None
+        if notional_in is not None and est_pl_dollars is not None:
+            tg(f"SELL {sym}\nStrategy [{strat}]: {STRAT_NAMES[strat]}\nReason: {reason}\nEntry: ${entry:.4f}\nExit (approx): ${price:.4f}\nNotional: ${notional_in:.2f}\nEst P/L: {pl_pct:+.2f}% (~${est_pl_dollars:+.2f})")
+        else:
+            tg(f"SELL {sym}\nStrategy [{strat}]: {STRAT_NAMES[strat]}\nReason: {reason}\nEntry: ${entry:.4f}\nExit (approx): ${price:.4f}\nEst P/L: {pl_pct:+.2f}%")
         state[strat] = None
     else:
         pl_pct = (price - entry) / entry * 100
@@ -688,6 +693,7 @@ def process_entry(strat, state, bars_dict, taken_syms, per_strategy_target,
                 'entry': price,
                 'stop': stop_price,
                 'atr': a14,
+                'notional': round(notional, 2),
                 'entry_time': datetime.now(timezone.utc).isoformat(),
                 'order_id': order['id'],
                 'qty': order.get('qty') or order.get('filled_qty'),
