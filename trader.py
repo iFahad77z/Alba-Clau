@@ -62,7 +62,19 @@ ST_PERIOD = 10
 ST_MULT = 3.0
 ORB_BARS = 6  # first 6 x 5-min bars = first 30 min of session
 
-ALL_STRATS = ('A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N')
+# Filter variants: maps "X2" -> base strategy "X". X2 inherits all of X's logic
+# but adds a "price > 200 EMA" filter on entry (long-term uptrend confirmation).
+# Note: F2 omitted because Strategy N already serves that role.
+FILTER_VARIANTS = {
+    'A2': 'A', 'B2': 'B', 'C2': 'C', 'D2': 'D', 'E2': 'E',
+    'G2': 'G', 'H2': 'H', 'I2': 'I', 'J2': 'J',
+    'K2': 'K', 'L2': 'L', 'M2': 'M',
+}
+
+ALL_STRATS = (
+    'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N',
+    'A2', 'B2', 'C2', 'D2', 'E2', 'G2', 'H2', 'I2', 'J2', 'K2', 'L2', 'M2',
+)
 
 STRAT_NAMES = {
     'A': 'Fast EMA Cross (9/21)',
@@ -79,7 +91,24 @@ STRAT_NAMES = {
     'L': 'Slow EMA + Take Profit (50/200 in, +1.5% TP or 50/200 bear out)',
     'M': 'Slow EMA No-Stop (50/200 in, exits ONLY on 50/200 bear cross)',
     'N': 'RSI Bounce + 200 EMA Trend Filter',
+    'A2': 'Fast EMA Cross (9/21) + 200 EMA Filter',
+    'B2': 'Medium EMA Cross (20/50) + 200 EMA Filter',
+    'C2': 'Donchian Breakout (20/10) + 200 EMA Filter',
+    'D2': 'MACD + 200 EMA Filter',
+    'E2': 'Bollinger Reversion + 200 EMA Filter',
+    'G2': 'SuperTrend + 200 EMA Filter',
+    'H2': 'Opening Range Breakout + 200 EMA Filter',
+    'I2': 'VWAP Reclaim + 200 EMA Filter',
+    'J2': 'Inside Bar Breakout + 200 EMA Filter',
+    'K2': 'Slow EMA (50/200) + 200 EMA Filter',
+    'L2': 'Slow EMA + TP + 200 EMA Filter',
+    'M2': 'Slow EMA No-Stop + 200 EMA Filter',
 }
+
+
+def base_strat(strat):
+    """Map a filter variant ('A2') to its base strategy ('A'). Identity for non-variants."""
+    return FILTER_VARIANTS.get(strat, strat)
 
 # Take-profit thresholds (% gain that triggers exit)
 TAKE_PROFIT_PER_STRAT = {
@@ -589,7 +618,26 @@ STOCK_ONLY_STRATS = {'H', 'I'}
 
 
 def get_entry_signal(strat, bars, sym, is_crypto):
-    """Returns (fired: bool, details: str, extra: dict) or (False, '', {})."""
+    """Returns (fired: bool, details: str, extra: dict) or (False, '', {}).
+    Filter variants (X2) delegate to the base strategy, then apply 200 EMA filter."""
+    if strat in FILTER_VARIANTS:
+        base = FILTER_VARIANTS[strat]
+        fired, details, extra = _get_entry_signal_base(base, bars, sym, is_crypto)
+        if not fired:
+            return False, '', {}
+        # Apply 200 EMA filter: current price must be above 200 EMA
+        closes = [float(b['c']) for b in bars]
+        e200 = ema_series(closes, 200)
+        n = len(closes) - 1
+        if e200[n] is None or closes[n] <= e200[n]:
+            return False, '', {}
+        details += f" + price>200EMA ({closes[n]:.4f}>{e200[n]:.4f})"
+        return True, details, extra
+    return _get_entry_signal_base(strat, bars, sym, is_crypto)
+
+
+def _get_entry_signal_base(strat, bars, sym, is_crypto):
+    """Original per-strategy entry signal logic (for the 14 base strategies)."""
     if strat == 'A':
         sig = signal_ema_cross(bars, 9, 21)
         if sig and sig['bull']:
@@ -655,7 +703,13 @@ def get_entry_signal(strat, bars, sym, is_crypto):
 
 
 def get_exit_signal(strat, bars, pos):
-    """Returns (should_exit: bool, reason: str)."""
+    """Returns (should_exit: bool, reason: str). Variants share exit logic with their base."""
+    if strat in FILTER_VARIANTS:
+        return _get_exit_signal_base(FILTER_VARIANTS[strat], bars, pos)
+    return _get_exit_signal_base(strat, bars, pos)
+
+
+def _get_exit_signal_base(strat, bars, pos):
     closes = [float(b['c']) for b in bars]
     price = closes[-1]
     if strat == 'A':
@@ -741,8 +795,9 @@ def process_exit(strat, state, bars_dict, force_close_stocks):
     stop = pos['stop']
 
     should_exit, reason = False, ''
-    skip_force_close = strat in NO_FORCE_CLOSE_STRATS
-    skip_atr_stop = strat in NO_ATR_STOP_STRATS
+    bs = base_strat(strat)
+    skip_force_close = bs in NO_FORCE_CLOSE_STRATS
+    skip_atr_stop = bs in NO_ATR_STOP_STRATS
     # Force-close applies to BOTH stocks and crypto at 19:30 UTC weekdays
     if force_close_stocks and not skip_force_close:
         should_exit, reason = True, 'FORCE CLOSE (30 min before market close)'
@@ -784,7 +839,7 @@ def process_entry(strat, state, bars_dict, taken_syms, per_strategy_target,
             continue
         if (not is_crypto) and block_new_stock_entries:
             continue
-        if is_crypto and strat in STOCK_ONLY_STRATS:
+        if is_crypto and base_strat(strat) in STOCK_ONLY_STRATS:
             continue  # ORB and VWAP don't apply to crypto
         bars = bars_dict.get(sym)
         if not bars:
@@ -802,12 +857,12 @@ def process_entry(strat, state, bars_dict, taken_syms, per_strategy_target,
         if not fired:
             continue
 
-        # Volume filter (where applicable)
-        if strat in VOL_FILTER_STRATS:
+        # Volume filter (where applicable) — use base strategy's properties
+        if base_strat(strat) in VOL_FILTER_STRATS:
             apply_vol = (not is_crypto) or market_open
             if apply_vol:
                 vm = vol_mult(bars)
-                threshold = VOL_MULT_PER_STRAT.get(strat, VOL_MULT_THRESHOLD)
+                threshold = VOL_MULT_PER_STRAT.get(base_strat(strat), VOL_MULT_THRESHOLD)
                 if vm < threshold:
                     continue
                 details += f" + vol {vm:.2f}x"
