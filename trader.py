@@ -62,7 +62,7 @@ ST_PERIOD = 10
 ST_MULT = 3.0
 ORB_BARS = 6  # first 6 x 5-min bars = first 30 min of session
 
-ALL_STRATS = ('A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K')
+ALL_STRATS = ('A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L')
 
 STRAT_NAMES = {
     'A': 'Fast EMA Cross (9/21)',
@@ -76,6 +76,12 @@ STRAT_NAMES = {
     'I': 'VWAP Reclaim',
     'J': 'Inside Bar Breakout',
     'K': 'Slow EMA Cross (50/200, no vol filter)',
+    'L': 'Slow Entry / Fast Exit (50/200 in, 9/21 or +1.5% out)',
+}
+
+# Take-profit thresholds (% gain that triggers exit)
+TAKE_PROFIT_PER_STRAT = {
+    'L': 1.5,  # Strategy L: take profit at +1.5%
 }
 
 WATCHLIST = [
@@ -543,6 +549,10 @@ def get_entry_signal(strat, bars, sym, is_crypto):
         sig = signal_ema_cross(bars, 50, 200)
         if sig and sig['bull']:
             return True, f"50/200 EMA bull cross | 50EMA={sig['fast']:.4f} 200EMA={sig['slow']:.4f}", sig
+    elif strat == 'L':
+        sig = signal_ema_cross(bars, 50, 200)
+        if sig and sig['bull']:
+            return True, f"50/200 EMA bull cross (slow-in/fast-out) | 50EMA={sig['fast']:.4f} 200EMA={sig['slow']:.4f} TP=+1.5%", sig
     elif strat == 'C':
         sig = signal_donchian(bars)
         if sig and sig['bull']:
@@ -594,6 +604,17 @@ def get_exit_signal(strat, bars, pos):
         sig = signal_ema_cross(bars, 50, 200)
         if sig and sig['bear']:
             return True, f"50/200 EMA bear cross"
+    elif strat == 'L':
+        # Exit logic: 1) take profit at +1.5%, else 2) 9/21 EMA bear cross
+        entry = pos['entry']
+        tp_pct = TAKE_PROFIT_PER_STRAT.get('L', None)
+        if tp_pct and entry > 0:
+            gain_pct = (price - entry) / entry * 100
+            if gain_pct >= tp_pct:
+                return True, f"TAKE PROFIT (+{gain_pct:.2f}% >= +{tp_pct}%)"
+        sig = signal_ema_cross(bars, 9, 21)
+        if sig and sig['bear']:
+            return True, f"9/21 EMA bear cross (slow-in/fast-out exit) (9={sig['fast']:.4f} <= 21={sig['slow']:.4f})"
     elif strat == 'C':
         sig = signal_donchian(bars)
         if sig and sig['bear']:
