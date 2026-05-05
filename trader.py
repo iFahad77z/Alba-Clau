@@ -800,7 +800,7 @@ def process_exit(strat, state, bars_dict, force_close_stocks):
     skip_atr_stop = bs in NO_ATR_STOP_STRATS
     # Force-close applies to STOCKS ONLY at 19:30 UTC weekdays. BTC trades 24/7.
     if (not is_crypto) and force_close_stocks and not skip_force_close:
-        should_exit, reason = True, 'FORCE CLOSE (30 min before market close)'
+        should_exit, reason = True, 'FORCE CLOSE (at market close 20:00 UTC)'
     elif price <= stop and not skip_atr_stop:
         should_exit, reason = True, f'STOP HIT (price={price:.4f} <= stop={stop:.4f})'
     else:
@@ -912,12 +912,14 @@ def run():
     utc_min = now_utc.hour * 60 + now_utc.minute
     market_open_min = 13 * 60 + 30
     market_close_min = 20 * 60
-    no_entry_after_min = market_close_min - 60
-    force_close_at_min = market_close_min - 30
+    no_entry_after_min = market_close_min - 60   # 19:00 UTC — last hour before close, no new stock entries
+    force_close_at_min = market_close_min        # 20:00 UTC — force-close all stocks at market close
     is_weekend = now_utc.weekday() >= 5
     market_open = (not is_weekend) and market_open_min <= utc_min < market_close_min
     block_new_stock_entries = (not market_open) or utc_min >= no_entry_after_min
-    force_close_stocks = (not is_weekend) and force_close_at_min <= utc_min < market_close_min
+    # Force-close fires for 30-minute window starting at 20:00 UTC. Orders queue if market is closed
+    # (paper trading) and fill at the next day's market open via Alpaca's queue.
+    force_close_stocks = (not is_weekend) and force_close_at_min <= utc_min < (force_close_at_min + 30)
     log(f'Time: UTC={now_utc:%H:%M} marketOpen={market_open} blockStockEntries={block_new_stock_entries} forceCloseStocks={force_close_stocks}')
 
     state = load_state()
