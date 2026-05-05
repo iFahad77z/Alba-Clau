@@ -87,8 +87,8 @@ TAKE_PROFIT_PER_STRAT = {
 
 # Strategies that skip the global ATR stop loss check
 NO_ATR_STOP_STRATS = {'M'}
-# Strategies that skip the 19:30 UTC force-close on stocks
-NO_FORCE_CLOSE_STRATS = {'M'}
+# Strategies that skip the 19:30 UTC force-close (empty — all strategies now force-close)
+NO_FORCE_CLOSE_STRATS = set()
 
 WATCHLIST = [
     ('GOOGL', False), ('AMZN', False), ('MSFT', False), ('NVDA', False),
@@ -682,7 +682,8 @@ def process_exit(strat, state, bars_dict, force_close_stocks):
     should_exit, reason = False, ''
     skip_force_close = strat in NO_FORCE_CLOSE_STRATS
     skip_atr_stop = strat in NO_ATR_STOP_STRATS
-    if (not is_crypto) and force_close_stocks and not skip_force_close:
+    # Force-close applies to BOTH stocks and crypto at 19:30 UTC weekdays
+    if force_close_stocks and not skip_force_close:
         should_exit, reason = True, 'FORCE CLOSE (30 min before market close)'
     elif price <= stop and not skip_atr_stop:
         should_exit, reason = True, f'STOP HIT (price={price:.4f} <= stop={stop:.4f})'
