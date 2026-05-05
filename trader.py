@@ -879,13 +879,12 @@ def process_entry(strat, state, bars_dict, taken_syms, per_strategy_target,
         # Falls back to cash if not present (some account types).
         nmbp = float(acct.get('non_marginable_buying_power', cash))
         available = min(cash, nmbp)
-        if available < 1:
-            log(f'[{strat}] BUY SKIPPED {sym}: no non-margin cash (cash=${cash:.2f}, non_margin_bp=${nmbp:.2f})')
+        # All-or-nothing sizing: only enter if at least 95% of the full per-strategy target
+        # is available. Prevents tiny noise trades from rationing capital across strategies.
+        if available < per_strategy_target * 0.95:
+            log(f'[{strat}] BUY SKIPPED {sym}: cash ${available:.2f} below 95% of target ${per_strategy_target:.2f}')
             continue
-        notional = min(per_strategy_target, available * CASH_PCT)
-        if notional < 1:
-            log(f'[{strat}] BUY SKIPPED {sym}: insufficient cash (${available:.2f})')
-            continue
+        notional = per_strategy_target * CASH_PCT
 
         stop_price = price - ATR_MULT * a14
         log(f'[{strat}] ENTRY SIGNAL {sym} @ {price:.4f} | {details} | ATR(14)={a14:.4f} stop={stop_price:.4f} notional=${notional:.2f}')
