@@ -798,8 +798,8 @@ def process_exit(strat, state, bars_dict, force_close_stocks):
     bs = base_strat(strat)
     skip_force_close = bs in NO_FORCE_CLOSE_STRATS
     skip_atr_stop = bs in NO_ATR_STOP_STRATS
-    # Force-close applies to BOTH stocks and crypto at 19:30 UTC weekdays
-    if force_close_stocks and not skip_force_close:
+    # Force-close applies to STOCKS ONLY at 19:30 UTC weekdays. BTC trades 24/7.
+    if (not is_crypto) and force_close_stocks and not skip_force_close:
         should_exit, reason = True, 'FORCE CLOSE (30 min before market close)'
     elif price <= stop and not skip_atr_stop:
         should_exit, reason = True, f'STOP HIT (price={price:.4f} <= stop={stop:.4f})'
