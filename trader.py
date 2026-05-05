@@ -814,9 +814,13 @@ def process_exit(strat, state, bars_dict, force_close_stocks):
         # Use partial close if multiple strategies hold the same symbol; otherwise full close
         same_sym_count = sum(1 for s, p in state.items() if p and p.get('symbol') == sym)
         if same_sym_count > 1 and pos.get('qty'):
-            close_position(sym, qty=pos['qty'])
+            result = close_position(sym, qty=pos['qty'])
         else:
-            close_position(sym)
+            result = close_position(sym)
+        if result is None:
+            # Close failed (e.g. pending order already exists, market closed, PDT). Keep state to retry next tick.
+            log(f'[{strat}] EXIT close failed for {sym}; keeping state to retry on next tick')
+            return
         notional_in = pos.get('notional')
         est_pl_dollars = (notional_in * pl_pct / 100) if notional_in else None
         if notional_in is not None and est_pl_dollars is not None:
