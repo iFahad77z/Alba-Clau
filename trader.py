@@ -199,6 +199,52 @@ def sync_state_with_alpaca(state):
             state[s] = None
 
 
+def claim_orphan_positions(state, bars_dict, alpaca_positions):
+    """Detect Alpaca positions with no strategy claim and assign them to flat strategy slots.
+    Uses Alpaca's avg_entry_price as the recorded entry, but sets a fresh ATR stop based
+    on current price so the claimed position has room to breathe instead of immediate stop-out."""
+    claimed_syms = {state[s]['symbol'] for s in ALL_STRATS if state.get(s)}
+    orphans = [(sym, p) for sym, p in alpaca_positions.items() if sym not in claimed_syms]
+    if not orphans:
+        return
+    flat_slots = [s for s in ALL_STRATS if not state.get(s)]
+    for sym, ap in orphans:
+        if not flat_slots:
+            log(f'ORPHAN UNCLAIMED {sym}: no flat strategy slots available')
+            continue
+        bars = bars_dict.get(sym)
+        if not bars:
+            log(f'ORPHAN UNCLAIMED {sym}: no bars data, cannot compute stop')
+            continue
+        closes = [float(b['c']) for b in bars]
+        highs = [float(b['h']) for b in bars]
+        lows = [float(b['l']) for b in bars]
+        a14 = atr(highs, lows, closes, ATR_PERIOD)
+        if not a14 or a14 <= 0:
+            log(f'ORPHAN UNCLAIMED {sym}: no valid ATR')
+            continue
+        slot = flat_slots.pop(0)
+        current_price = closes[-1]
+        stop_price = current_price - ATR_MULT * a14
+        actual_entry = float(ap.get('avg_entry_price', current_price))
+        try:
+            market_value = float(ap.get('market_value', 0))
+        except Exception:
+            market_value = 0
+        state[slot] = {
+            'symbol': sym,
+            'entry': actual_entry,
+            'stop': stop_price,
+            'atr': a14,
+            'notional': round(market_value, 2),
+            'entry_time': datetime.now(timezone.utc).isoformat(),
+            'order_id': 'orphan-claimed',
+            'qty': ap.get('qty'),
+        }
+        log(f'[{slot}] CLAIMED ORPHAN {sym} @ entry={actual_entry:.4f} (current={current_price:.4f}) | stop={stop_price:.4f} qty={ap.get("qty")} mv=${market_value:.2f}')
+        tg(f"CLAIMED ORPHAN {sym}\nStrategy [{slot}]: {STRAT_NAMES[slot]}\nEntry (actual): ${actual_entry:.4f}\nCurrent: ${current_price:.4f}\nFresh stop: ${stop_price:.4f}\nNotional: ${market_value:.2f}")
+
+
 def buy_notional(symbol, notional, is_crypto):
     body = {
         'symbol': symbol,
@@ -821,6 +867,10 @@ def run():
         bars = get_bars(sym, is_crypto)
         if bars and len(bars) >= 250:
             bars_dict[sym] = bars
+
+    # Claim any orphan Alpaca positions (existing positions that no strategy is tracking)
+    alpaca_positions_now = get_alpaca_positions()
+    claim_orphan_positions(state, bars_dict, alpaca_positions_now)
 
     # Exits first
     for s in ALL_STRATS:
