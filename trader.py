@@ -62,7 +62,7 @@ ST_PERIOD = 10
 ST_MULT = 3.0
 ORB_BARS = 6  # first 6 x 5-min bars = first 30 min of session
 
-ALL_STRATS = ('A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L')
+ALL_STRATS = ('A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M')
 
 STRAT_NAMES = {
     'A': 'Fast EMA Cross (9/21)',
@@ -77,12 +77,18 @@ STRAT_NAMES = {
     'J': 'Inside Bar Breakout',
     'K': 'Slow EMA Cross (50/200, no vol filter)',
     'L': 'Slow EMA + Take Profit (50/200 in, +1.5% TP or 50/200 bear out)',
+    'M': 'Slow EMA No-Stop (50/200 in, exits ONLY on 50/200 bear cross)',
 }
 
 # Take-profit thresholds (% gain that triggers exit)
 TAKE_PROFIT_PER_STRAT = {
     'L': 1.5,  # Strategy L: take profit at +1.5%
 }
+
+# Strategies that skip the global ATR stop loss check
+NO_ATR_STOP_STRATS = {'M'}
+# Strategies that skip the 19:30 UTC force-close on stocks
+NO_FORCE_CLOSE_STRATS = {'M'}
 
 WATCHLIST = [
     ('GOOGL', False), ('AMZN', False), ('MSFT', False), ('NVDA', False),
@@ -553,6 +559,10 @@ def get_entry_signal(strat, bars, sym, is_crypto):
         sig = signal_ema_cross(bars, 50, 200)
         if sig and sig['bull']:
             return True, f"50/200 EMA bull cross (with +1.5% TP) | 50EMA={sig['fast']:.4f} 200EMA={sig['slow']:.4f}", sig
+    elif strat == 'M':
+        sig = signal_ema_cross(bars, 50, 200)
+        if sig and sig['bull']:
+            return True, f"50/200 EMA bull cross (no-stop, ride till bear) | 50EMA={sig['fast']:.4f} 200EMA={sig['slow']:.4f}", sig
     elif strat == 'C':
         sig = signal_donchian(bars)
         if sig and sig['bull']:
@@ -615,6 +625,11 @@ def get_exit_signal(strat, bars, pos):
         sig = signal_ema_cross(bars, 50, 200)
         if sig and sig['bear']:
             return True, f"50/200 EMA bear cross (after no TP)"
+    elif strat == 'M':
+        # M's only exit signal is 50/200 bear cross. ATR stop and force-close also disabled (see process_exit).
+        sig = signal_ema_cross(bars, 50, 200)
+        if sig and sig['bear']:
+            return True, f"50/200 EMA bear cross"
     elif strat == 'C':
         sig = signal_donchian(bars)
         if sig and sig['bear']:
@@ -665,9 +680,11 @@ def process_exit(strat, state, bars_dict, force_close_stocks):
     stop = pos['stop']
 
     should_exit, reason = False, ''
-    if (not is_crypto) and force_close_stocks:
+    skip_force_close = strat in NO_FORCE_CLOSE_STRATS
+    skip_atr_stop = strat in NO_ATR_STOP_STRATS
+    if (not is_crypto) and force_close_stocks and not skip_force_close:
         should_exit, reason = True, 'FORCE CLOSE (30 min before market close)'
-    elif price <= stop:
+    elif price <= stop and not skip_atr_stop:
         should_exit, reason = True, f'STOP HIT (price={price:.4f} <= stop={stop:.4f})'
     else:
         ex, r = get_exit_signal(strat, bars, pos)
