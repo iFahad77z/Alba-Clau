@@ -62,7 +62,7 @@ ST_PERIOD = 10
 ST_MULT = 3.0
 ORB_BARS = 6  # first 6 x 5-min bars = first 30 min of session
 
-ALL_STRATS = ('A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M')
+ALL_STRATS = ('A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N')
 
 STRAT_NAMES = {
     'A': 'Fast EMA Cross (9/21)',
@@ -78,6 +78,7 @@ STRAT_NAMES = {
     'K': 'Slow EMA Cross (50/200, no vol filter)',
     'L': 'Slow EMA + Take Profit (50/200 in, +1.5% TP or 50/200 bear out)',
     'M': 'Slow EMA No-Stop (50/200 in, exits ONLY on 50/200 bear cross)',
+    'N': 'RSI Bounce + 200 EMA Trend Filter',
 }
 
 # Take-profit thresholds (% gain that triggers exit)
@@ -641,6 +642,15 @@ def get_entry_signal(strat, bars, sym, is_crypto):
         sig = signal_inside_bar(bars)
         if sig and sig['bull']:
             return True, f"Inside bar break above mother high={sig['mother_high']:.4f} | price={sig['price']:.4f}", sig
+    elif strat == 'N':
+        # RSI bounce + 200 EMA trend filter: only fire when current price is above the 200 EMA
+        sig_rsi = signal_rsi(bars)
+        if sig_rsi and sig_rsi['bull']:
+            closes = [float(b['c']) for b in bars]
+            e200 = ema_series(closes, 200)
+            n = len(closes) - 1
+            if e200[n] is not None and closes[n] > e200[n]:
+                return True, f"RSI bounce + price>200EMA | RSI {sig_rsi['rsi_prev']:.1f}->{sig_rsi['rsi']:.1f} | price {closes[n]:.4f} > 200EMA {e200[n]:.4f}", sig_rsi
     return False, '', {}
 
 
@@ -708,6 +718,11 @@ def get_exit_signal(strat, bars, pos):
         sig = signal_inside_bar(bars)
         if sig and sig['bear']:
             return True, f"Inside bar break below mother low={sig['mother_low']:.4f}"
+    elif strat == 'N':
+        # Same exit logic as F: RSI overbought (≥70). ATR stop and force-close are global.
+        sig = signal_rsi(bars)
+        if sig and sig['overbought']:
+            return True, f"RSI overbought ({sig['rsi']:.1f})"
     return False, ''
 
 
