@@ -41,11 +41,12 @@ CASH_PCT = 0.99
 VOL_MULT_THRESHOLD = 1.0  # default for strategies that don't override
 VOL_MULT_PER_STRAT = {
     'A': 1.0,
-    'B': 0.5,  # 50/200 EMA fires rarely; loosen volume filter to actually catch the rare crosses
+    'B': 1.0,  # 20/50 EMA — back to standard threshold
     'D': 1.0,
     'G': 1.0,
     'H': 1.0,
     'J': 1.0,
+    # K (50/200) intentionally absent — no volume filter (per spec)
 }
 VOL_LOOKBACK = 20
 
@@ -61,11 +62,11 @@ ST_PERIOD = 10
 ST_MULT = 3.0
 ORB_BARS = 6  # first 6 x 5-min bars = first 30 min of session
 
-ALL_STRATS = ('A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J')
+ALL_STRATS = ('A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K')
 
 STRAT_NAMES = {
     'A': 'Fast EMA Cross (9/21)',
-    'B': 'Slow EMA Cross (50/200)',
+    'B': 'Medium EMA Cross (20/50)',
     'C': 'Donchian Breakout (20/10)',
     'D': 'MACD (12/26/9)',
     'E': 'Bollinger Reversion (20, 2σ)',
@@ -74,6 +75,7 @@ STRAT_NAMES = {
     'H': 'Opening Range Breakout',
     'I': 'VWAP Reclaim',
     'J': 'Inside Bar Breakout',
+    'K': 'Slow EMA Cross (50/200, no vol filter)',
 }
 
 WATCHLIST = [
@@ -534,6 +536,10 @@ def get_entry_signal(strat, bars, sym, is_crypto):
         if sig and sig['bull']:
             return True, f"9/21 EMA bull cross | 9EMA={sig['fast']:.4f} 21EMA={sig['slow']:.4f}", sig
     elif strat == 'B':
+        sig = signal_ema_cross(bars, 20, 50)
+        if sig and sig['bull']:
+            return True, f"20/50 EMA bull cross | 20EMA={sig['fast']:.4f} 50EMA={sig['slow']:.4f}", sig
+    elif strat == 'K':
         sig = signal_ema_cross(bars, 50, 200)
         if sig and sig['bull']:
             return True, f"50/200 EMA bull cross | 50EMA={sig['fast']:.4f} 200EMA={sig['slow']:.4f}", sig
@@ -581,6 +587,10 @@ def get_exit_signal(strat, bars, pos):
         if sig and sig['bear']:
             return True, f"9/21 EMA bear cross (9={sig['fast']:.4f} <= 21={sig['slow']:.4f})"
     elif strat == 'B':
+        sig = signal_ema_cross(bars, 20, 50)
+        if sig and sig['bear']:
+            return True, f"20/50 EMA bear cross"
+    elif strat == 'K':
         sig = signal_ema_cross(bars, 50, 200)
         if sig and sig['bear']:
             return True, f"50/200 EMA bear cross"
@@ -761,8 +771,9 @@ def run():
         save_state(state)
         return
     equity = float(acct['equity'])
-    per_strategy_target = round(equity / 10 * CASH_PCT, 2)
-    log(f'Equity: ${equity:.2f} | per-strategy target: ${per_strategy_target:.2f} (10% each)')
+    per_strategy_target = round(equity / len(ALL_STRATS) * CASH_PCT, 2)
+    pct_each = round(100 / len(ALL_STRATS), 2)
+    log(f'Equity: ${equity:.2f} | per-strategy target: ${per_strategy_target:.2f} ({pct_each}% each, {len(ALL_STRATS)} strategies)')
     summary = ' | '.join(f"{s}={state[s] and state[s]['symbol'] or 'flat'}" for s in ALL_STRATS)
     log(f'State: {summary}')
 
