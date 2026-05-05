@@ -748,7 +748,7 @@ def process_entry(strat, state, bars_dict, taken_syms, per_strategy_target,
 
 
 def run():
-    log('=== Multi-strategy LIVE tick (10 strategies) ===')
+    log(f'=== Multi-strategy LIVE tick ({len(ALL_STRATS)} strategies) ===')
 
     now_utc = datetime.now(timezone.utc)
     utc_min = now_utc.hour * 60 + now_utc.minute
