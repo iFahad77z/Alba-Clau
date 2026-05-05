@@ -76,7 +76,7 @@ STRAT_NAMES = {
     'I': 'VWAP Reclaim',
     'J': 'Inside Bar Breakout',
     'K': 'Slow EMA Cross (50/200, no vol filter)',
-    'L': 'Slow Entry / Fast Exit (50/200 in, 9/21 or +1.5% out)',
+    'L': 'Slow EMA + Take Profit (50/200 in, +1.5% TP or 50/200 bear out)',
 }
 
 # Take-profit thresholds (% gain that triggers exit)
@@ -552,7 +552,7 @@ def get_entry_signal(strat, bars, sym, is_crypto):
     elif strat == 'L':
         sig = signal_ema_cross(bars, 50, 200)
         if sig and sig['bull']:
-            return True, f"50/200 EMA bull cross (slow-in/fast-out) | 50EMA={sig['fast']:.4f} 200EMA={sig['slow']:.4f} TP=+1.5%", sig
+            return True, f"50/200 EMA bull cross (with +1.5% TP) | 50EMA={sig['fast']:.4f} 200EMA={sig['slow']:.4f}", sig
     elif strat == 'C':
         sig = signal_donchian(bars)
         if sig and sig['bull']:
@@ -605,16 +605,16 @@ def get_exit_signal(strat, bars, pos):
         if sig and sig['bear']:
             return True, f"50/200 EMA bear cross"
     elif strat == 'L':
-        # Exit logic: 1) take profit at +1.5%, else 2) 9/21 EMA bear cross
+        # Exit logic: 1) take profit at +1.5%, else 2) 50/200 EMA bear cross (ATR stop is handled globally)
         entry = pos['entry']
         tp_pct = TAKE_PROFIT_PER_STRAT.get('L', None)
         if tp_pct and entry > 0:
             gain_pct = (price - entry) / entry * 100
             if gain_pct >= tp_pct:
                 return True, f"TAKE PROFIT (+{gain_pct:.2f}% >= +{tp_pct}%)"
-        sig = signal_ema_cross(bars, 9, 21)
+        sig = signal_ema_cross(bars, 50, 200)
         if sig and sig['bear']:
-            return True, f"9/21 EMA bear cross (slow-in/fast-out exit) (9={sig['fast']:.4f} <= 21={sig['slow']:.4f})"
+            return True, f"50/200 EMA bear cross (after no TP)"
     elif strat == 'C':
         sig = signal_donchian(bars)
         if sig and sig['bear']:
