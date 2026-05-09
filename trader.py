@@ -965,13 +965,22 @@ def process_exit(strat, state, bars_dict, force_close_stocks):
             tg(f"SELL {sym}\nStrategy [{strat}]: {STRAT_NAMES[strat]}\nReason: {reason}\nEntry: ${entry:.4f}\nExit (approx): ${price:.4f}\nNotional: ${notional_in:.2f}\nEst P/L: {pl_pct:+.2f}% (~${est_pl_dollars:+.2f})")
         else:
             tg(f"SELL {sym}\nStrategy [{strat}]: {STRAT_NAMES[strat]}\nReason: {reason}\nEntry: ${entry:.4f}\nExit (approx): ${price:.4f}\nEst P/L: {pl_pct:+.2f}%")
-        # Record trade for daily summary
+        # Record trade for daily summary AND lifetime stats
         daily = state.setdefault('_daily', {'date': '', 'sent': False, 'trades': [], 'start_equity': None})
-        daily.setdefault('trades', []).append({
+        trade_rec = {
             'strat': strat, 'sym': sym, 'pl_pct': round(pl_pct, 2),
             'pl_usd': round(est_pl_dollars, 2) if est_pl_dollars is not None else None,
             'reason': reason,
-        })
+        }
+        daily.setdefault('trades', []).append(trade_rec)
+        # Lifetime cumulative stats per strategy (never resets)
+        lifetime = state.setdefault('_lifetime', {})
+        d = lifetime.setdefault(strat, {'n': 0, 'w': 0, 'l': 0, 'usd': 0.0, 'pct': 0.0})
+        d['n'] += 1
+        if pl_pct > 0: d['w'] += 1
+        else: d['l'] += 1
+        d['usd'] += (est_pl_dollars or 0.0)
+        d['pct'] += pl_pct
         state[strat] = None
     else:
         pl_pct = (price - entry) / entry * 100
@@ -1121,14 +1130,52 @@ def send_daily_summary(state, equity_now, is_weekend=False):
         f"Trades: {n}  W-L: {wins}-{losses}" + (f" ({wins/n*100:.0f}% win)" if n else ""),
         f"Realized: ${realized_usd:+,.2f}",
         "",
-        "Per-strategy:" if by_strat else no_trade_msg,
+        "Today's per-strategy:" if by_strat else no_trade_msg,
     ]
     for s in sorted(by_strat.keys(), key=lambda x: -by_strat[x]['usd']):
         d = by_strat[s]
         lines.append(f"[{s}] {d['n']} trade{'s' if d['n']!=1 else ''}, W:{d['w']} L:{d['l']}, ${d['usd']:+,.2f} ({d['pct']:+.2f}%)")
+
+    # ===== Lifetime block: all 43 strategies, cumulative stats since deployment =====
+    lifetime = state.get('_lifetime', {}) or {}
+    # Status of each slot right now (flat / holding sym)
+    lines.append("")
+    lines.append("Lifetime (since deploy):")
+    # Sort: strategies with trades first (by $ desc), then untraded ones
+    traded = [s for s in ALL_STRATS if s in lifetime and lifetime[s].get('n', 0) > 0]
+    untraded = [s for s in ALL_STRATS if s not in lifetime or lifetime[s].get('n', 0) == 0]
+    traded.sort(key=lambda x: -lifetime[x]['usd'])
+    for s in traded:
+        d = lifetime[s]
+        pos = state.get(s)
+        held = f" 🟢{pos['symbol']}" if pos and pos.get('symbol') else ""
+        lines.append(f"[{s}] {d['n']}t W:{d['w']} L:{d['l']} ${d['usd']:+,.0f} ({d['pct']:+.1f}%){held}")
+    if untraded:
+        # Just list untraded strategies on one or two lines (no zeros to crunch through)
+        held_among_untraded = []
+        truly_flat = []
+        for s in untraded:
+            pos = state.get(s)
+            if pos and pos.get('symbol'):
+                held_among_untraded.append(f"[{s}]🟢{pos['symbol']}")
+            else:
+                truly_flat.append(s)
+        if held_among_untraded:
+            lines.append("Holding (no closed trades yet): " + " ".join(held_among_untraded))
+        if truly_flat:
+            lines.append(f"Never fired ({len(truly_flat)}): " + ", ".join(truly_flat))
+
     msg = "\n".join(lines)
     log("DAILY SUMMARY:\n" + msg)
-    tg(msg)
+    # Telegram has a 4096-char limit per message — split if oversized
+    if len(msg) <= 4000:
+        tg(msg)
+    else:
+        # Split on the lifetime divider
+        parts = msg.split("Lifetime (since deploy):")
+        tg(parts[0].rstrip())
+        if len(parts) > 1:
+            tg("Lifetime (since deploy):" + parts[1])
 
 
 def maybe_send_daily_summary(state, utc_min, is_weekend, equity_now):
