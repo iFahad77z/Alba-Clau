@@ -1084,6 +1084,11 @@ def process_entry(strat, state, bars_dict, taken_syms, per_strategy_target,
 
         stop_price = price - ATR_MULT * a14
         log(f'[{strat}] ENTRY SIGNAL {sym} @ {price:.4f} | {details} | ATR(14)={a14:.4f} stop={stop_price:.4f} notional=${notional:.2f}')
+        # Compute the planned qty up front so partial-close (used when multiple strategies
+        # share a symbol) has a valid number to send. Notional-based crypto buys come back
+        # from Alpaca with qty=null and filled_qty=0 at placement time, so we couldn't rely
+        # on the order response alone.
+        planned_qty = round(notional / price, 9) if price > 0 else 0
         order = buy_notional(sym, notional, is_crypto)
         if not order:
             tg_error_once(
@@ -1102,7 +1107,11 @@ def process_entry(strat, state, bars_dict, taken_syms, per_strategy_target,
                 'notional': round(notional, 2),
                 'entry_time': datetime.now(timezone.utc).isoformat(),
                 'order_id': order['id'],
-                'qty': order.get('qty') or order.get('filled_qty'),
+                # Prefer the order's reported qty (when it's already filled), else fall
+                # back to our computed planned_qty. Never store 0 — that breaks partial close.
+                'qty': (float(order.get('qty')) if order.get('qty') else None) or
+                       (float(order.get('filled_qty')) if order.get('filled_qty') and float(order.get('filled_qty')) > 0 else None) or
+                       planned_qty,
             }
             # taken_syms retained as a no-op for now (no symbol is locked). Kept for
             # backward compat in case we want to re-enable per-symbol concurrency caps later.
