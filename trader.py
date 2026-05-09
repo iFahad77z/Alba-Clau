@@ -71,9 +71,23 @@ FILTER_VARIANTS = {
     'K2': 'K', 'L2': 'L', 'M2': 'M',
 }
 
+# Trailing-stop variants ("copy 3"): maps "X3" -> base strategy "X". X3 has IDENTICAL
+# entry/exit signal logic to its base, but uses a ratcheting trailing stop instead of a
+# fixed ATR stop:
+#   * +1×ATR profit -> stop moves to breakeven (entry price)
+#   * +2×ATR profit -> stop trails at price - 1.5×ATR (locks in gains)
+#   * stop never moves down
+# A/B test: every base strategy has a "3" twin to measure trailing-stop impact.
+TRAIL_VARIANTS = {
+    'A3': 'A', 'B3': 'B', 'C3': 'C', 'D3': 'D', 'E3': 'E', 'F3': 'F', 'G3': 'G',
+    'H3': 'H', 'I3': 'I', 'J3': 'J', 'K3': 'K', 'L3': 'L', 'M3': 'M', 'N3': 'N',
+}
+TRAILING_STOP_STRATS = set(TRAIL_VARIANTS.keys())
+
 ALL_STRATS = (
     'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N',
     'A2', 'B2', 'C2', 'D2', 'E2', 'G2', 'H2', 'I2', 'J2', 'K2', 'L2', 'M2',
+    'A3', 'B3', 'C3', 'D3', 'E3', 'F3', 'G3', 'H3', 'I3', 'J3', 'K3', 'L3', 'M3', 'N3',
 )
 
 STRAT_NAMES = {
@@ -103,12 +117,30 @@ STRAT_NAMES = {
     'K2': 'Slow EMA (50/200) + 200 EMA Filter',
     'L2': 'Slow EMA + TP + 200 EMA Filter',
     'M2': 'Slow EMA No-Stop + 200 EMA Filter',
+    'A3': 'Fast EMA Cross (9/21) + Trailing Stop',
+    'B3': 'Medium EMA Cross (20/50) + Trailing Stop',
+    'C3': 'Donchian Breakout (20/10) + Trailing Stop',
+    'D3': 'MACD + Trailing Stop',
+    'E3': 'Bollinger Reversion + Trailing Stop',
+    'F3': 'RSI Bounce + Trailing Stop',
+    'G3': 'SuperTrend + Trailing Stop',
+    'H3': 'Opening Range Breakout + Trailing Stop',
+    'I3': 'VWAP Reclaim + Trailing Stop',
+    'J3': 'Inside Bar Breakout + Trailing Stop',
+    'K3': 'Slow EMA (50/200) + Trailing Stop',
+    'L3': 'Slow EMA + TP + Trailing Stop',
+    'M3': 'Slow EMA No-Stop + Trailing Stop (no-op for M3 — no stop)',
+    'N3': 'RSI Bounce + 200 EMA Trend Filter + Trailing Stop',
 }
 
 
 def base_strat(strat):
-    """Map a filter variant ('A2') to its base strategy ('A'). Identity for non-variants."""
-    return FILTER_VARIANTS.get(strat, strat)
+    """Map a variant ('A2', 'A3') to its base strategy ('A'). Identity for non-variants."""
+    if strat in FILTER_VARIANTS:
+        return FILTER_VARIANTS[strat]
+    if strat in TRAIL_VARIANTS:
+        return TRAIL_VARIANTS[strat]
+    return strat
 
 # Take-profit thresholds (% gain that triggers exit)
 TAKE_PROFIT_PER_STRAT = {
@@ -128,6 +160,11 @@ WATCHLIST = [
     ('LRCX', False), ('QCOM', False), ('KLAC', False), ('TXN', False),
     ('CVX', False), ('XOM', False), ('GLW', False), ('BTC/USD', True),
 ]
+
+# Symbols blocked from new entries based on consistent-loser data:
+#   CVX: 0-6 W-L (-$17.84)   SLB: 0-9 W-L (-$10.33)   CF: 4-12 W-L (-$25.81)
+# Existing positions in these symbols still get exit-managed; only NEW entries are blocked.
+BLACKLIST = {'CVX', 'SLB', 'CF'}
 
 
 def log(msg):
@@ -794,8 +831,26 @@ def process_exit(strat, state, bars_dict, force_close_stocks):
     entry = pos['entry']
     stop = pos['stop']
 
-    should_exit, reason = False, ''
     bs = base_strat(strat)
+
+    # Trailing stop ratchet (X3 variants only): never lowers, only raises.
+    #   * +1×ATR profit -> stop = max(stop, entry)        (move to breakeven)
+    #   * +2×ATR profit -> stop = max(stop, price - 1.5×ATR)  (trail)
+    if strat in TRAILING_STOP_STRATS and bs not in NO_ATR_STOP_STRATS:
+        a14 = pos.get('atr')
+        if a14 and a14 > 0:
+            profit = price - entry
+            new_stop = stop
+            if profit >= 2.0 * a14:
+                new_stop = max(new_stop, price - ATR_MULT * a14)
+            elif profit >= 1.0 * a14:
+                new_stop = max(new_stop, entry)  # breakeven
+            if new_stop > stop:
+                log(f'[{strat}] TRAIL stop {stop:.4f} -> {new_stop:.4f} (price={price:.4f} entry={entry:.4f} ATR={a14:.4f})')
+                stop = new_stop
+                pos['stop'] = new_stop
+
+    should_exit, reason = False, ''
     skip_force_close = bs in NO_FORCE_CLOSE_STRATS
     skip_atr_stop = bs in NO_ATR_STOP_STRATS
     # Force-close applies to STOCKS ONLY at 19:30 UTC weekdays. BTC trades 24/7.
@@ -827,6 +882,13 @@ def process_exit(strat, state, bars_dict, force_close_stocks):
             tg(f"SELL {sym}\nStrategy [{strat}]: {STRAT_NAMES[strat]}\nReason: {reason}\nEntry: ${entry:.4f}\nExit (approx): ${price:.4f}\nNotional: ${notional_in:.2f}\nEst P/L: {pl_pct:+.2f}% (~${est_pl_dollars:+.2f})")
         else:
             tg(f"SELL {sym}\nStrategy [{strat}]: {STRAT_NAMES[strat]}\nReason: {reason}\nEntry: ${entry:.4f}\nExit (approx): ${price:.4f}\nEst P/L: {pl_pct:+.2f}%")
+        # Record trade for daily summary
+        daily = state.setdefault('_daily', {'date': '', 'sent': False, 'trades': [], 'start_equity': None})
+        daily.setdefault('trades', []).append({
+            'strat': strat, 'sym': sym, 'pl_pct': round(pl_pct, 2),
+            'pl_usd': round(est_pl_dollars, 2) if est_pl_dollars is not None else None,
+            'reason': reason,
+        })
         state[strat] = None
     else:
         pl_pct = (price - entry) / entry * 100
@@ -846,6 +908,9 @@ def process_entry(strat, state, bars_dict, taken_syms, per_strategy_target,
 
     for sym, is_crypto in WATCHLIST:
         if sym in taken_syms:
+            continue
+        # Skip blacklisted chronic losers (existing positions still exit normally).
+        if sym in BLACKLIST:
             continue
         # Stocks: blocked outside 13:30–15:30 UTC normal trading. The all-in path bypasses
         # this block during the 15:30–16:00 UTC last-entry window.
@@ -924,6 +989,73 @@ def process_entry(strat, state, bars_dict, taken_syms, per_strategy_target,
     return False
 
 
+def send_daily_summary(state, equity_now):
+    daily = state.get('_daily') or {}
+    trades = daily.get('trades', [])
+    start_eq = daily.get('start_equity')
+    eq_change_usd = (equity_now - start_eq) if (start_eq is not None) else None
+    eq_change_pct = (eq_change_usd / start_eq * 100) if (start_eq and eq_change_usd is not None) else None
+
+    n = len(trades)
+    wins = sum(1 for t in trades if (t.get('pl_pct') or 0) > 0)
+    losses = n - wins
+    realized_usd = sum((t.get('pl_usd') or 0) for t in trades)
+
+    # Per-strategy aggregation
+    by_strat = {}
+    for t in trades:
+        s = t['strat']
+        d = by_strat.setdefault(s, {'n': 0, 'w': 0, 'l': 0, 'usd': 0.0})
+        d['n'] += 1
+        if (t.get('pl_pct') or 0) > 0: d['w'] += 1
+        else: d['l'] += 1
+        d['usd'] += (t.get('pl_usd') or 0)
+
+    lines = [
+        f"📊 Daily Summary — {daily.get('date','?')}",
+        f"Equity: ${equity_now:,.2f}" + (f" ({eq_change_pct:+.2f}%, ${eq_change_usd:+,.2f})" if eq_change_pct is not None else ""),
+        f"Trades: {n}  W-L: {wins}-{losses}" + (f" ({wins/n*100:.0f}% win)" if n else ""),
+        f"Realized: ${realized_usd:+,.2f}",
+        "",
+        "Per-strategy:" if by_strat else "No trades closed today.",
+    ]
+    for s in sorted(by_strat.keys(), key=lambda x: -by_strat[x]['usd']):
+        d = by_strat[s]
+        lines.append(f"[{s}] {d['n']} trade{'s' if d['n']!=1 else ''}, {d['w']}-{d['l']}, ${d['usd']:+,.2f}")
+    msg = "\n".join(lines)
+    log("DAILY SUMMARY:\n" + msg)
+    tg(msg)
+
+
+def maybe_send_daily_summary(state, utc_min, is_weekend, equity_now):
+    """Send daily summary at 19:40 UTC if all stocks are flat, else fall back to 20:00 UTC.
+    Only sends once per UTC date. Skipped on weekends."""
+    if is_weekend:
+        return
+    daily = state.setdefault('_daily', {'date': '', 'sent': False, 'trades': [], 'start_equity': None})
+    today = datetime.now(timezone.utc).date().isoformat()
+    if daily.get('date') != today:
+        # New day — reset
+        daily['date'] = today
+        daily['sent'] = False
+        daily['trades'] = []
+        daily['start_equity'] = equity_now
+    if daily.get('sent'):
+        return
+    # Determine if all stocks are flat
+    all_stocks_flat = True
+    for s in ALL_STRATS:
+        p = state.get(s)
+        if p and p.get('symbol') and p['symbol'] != 'BTC/USD':
+            all_stocks_flat = False
+            break
+    early_window  = (19*60 + 40) <= utc_min < (19*60 + 45)
+    late_fallback = (20*60)      <= utc_min < (20*60 + 5)
+    if (early_window and all_stocks_flat) or late_fallback:
+        send_daily_summary(state, equity_now)
+        daily['sent'] = True
+
+
 def run():
     log(f'=== Multi-strategy LIVE tick ({len(ALL_STRATS)} strategies) ===')
 
@@ -986,7 +1118,7 @@ def run():
     # Entries
     if in_last_entry_window:
         # All-in mode: try strategies in order until ONE fires, deploys all cash, and we stop.
-        log(f'[ALL-IN WINDOW] 19:30-20:00 UTC: scanning for first signal to deploy all available cash')
+        log(f'[ALL-IN WINDOW] 15:30-16:00 UTC: scanning for first signal to deploy all available cash')
         for s in ALL_STRATS:
             placed = process_entry(s, state, bars_dict, taken_syms, per_strategy_target,
                                    block_new_stock_entries, market_open, all_in_mode=True)
@@ -997,6 +1129,10 @@ def run():
         for s in ALL_STRATS:
             process_entry(s, state, bars_dict, taken_syms, per_strategy_target,
                           block_new_stock_entries, market_open)
+
+    # Fix the all-in window log message (window is now 15:30-16:00 UTC; older log line was stale)
+    # Daily summary: 19:40 UTC if all stocks flat, else fallback at 20:00 UTC.
+    maybe_send_daily_summary(state, utc_min, is_weekend, equity)
 
     save_state(state)
 
