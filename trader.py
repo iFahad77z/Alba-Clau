@@ -800,7 +800,7 @@ def process_exit(strat, state, bars_dict, force_close_stocks):
     skip_atr_stop = bs in NO_ATR_STOP_STRATS
     # Force-close applies to STOCKS ONLY at 19:30 UTC weekdays. BTC trades 24/7.
     if (not is_crypto) and force_close_stocks and not skip_force_close:
-        should_exit, reason = True, 'FORCE CLOSE (at market close 20:00 UTC)'
+        should_exit, reason = True, 'FORCE CLOSE (19:30 UTC, 30 min before market close)'
     elif price <= stop and not skip_atr_stop:
         should_exit, reason = True, f'STOP HIT (price={price:.4f} <= stop={stop:.4f})'
     else:
@@ -834,15 +834,24 @@ def process_exit(strat, state, bars_dict, force_close_stocks):
 
 
 def process_entry(strat, state, bars_dict, taken_syms, per_strategy_target,
-                  block_new_stock_entries, market_open):
+                  block_new_stock_entries, market_open, all_in_mode=False):
+    """
+    Returns True if an entry was placed for this strategy this tick, False otherwise.
+    If all_in_mode is True, the entry uses ALL available cash (capped to ~95% of the
+    free buying power to allow for slippage), instead of per_strategy_target. The caller
+    is responsible for stopping the loop after the first all-in entry fires.
+    """
     if state.get(strat):
-        return  # already holding
+        return False  # already holding
 
     for sym, is_crypto in WATCHLIST:
         if sym in taken_syms:
             continue
-        if (not is_crypto) and block_new_stock_entries:
+        # Stocks: blocked outside 13:30–15:30 UTC normal trading. The all-in path bypasses
+        # this block during the 15:30–16:00 UTC last-entry window.
+        if (not is_crypto) and block_new_stock_entries and not all_in_mode:
             continue
+        # BTC: 24/7, no time gating. May also be the all-in pick during 15:30–16:00 UTC.
         if is_crypto and base_strat(strat) in STOCK_ONLY_STRATS:
             continue  # ORB and VWAP don't apply to crypto
         bars = bars_dict.get(sym)
@@ -879,12 +888,20 @@ def process_entry(strat, state, bars_dict, taken_syms, per_strategy_target,
         # Falls back to cash if not present (some account types).
         nmbp = float(acct.get('non_marginable_buying_power', cash))
         available = min(cash, nmbp)
-        # All-or-nothing sizing: only enter if at least 95% of the full per-strategy target
-        # is available. Prevents tiny noise trades from rationing capital across strategies.
-        if available < per_strategy_target * 0.95:
-            log(f'[{strat}] BUY SKIPPED {sym}: cash ${available:.2f} below 95% of target ${per_strategy_target:.2f}')
-            continue
-        notional = per_strategy_target * CASH_PCT
+        if all_in_mode:
+            # Last-entry window: deploy ALL available cash on the first signal that fires.
+            # Floor at $50 to avoid placing dust orders if cash is essentially zero.
+            if available < 50:
+                log(f'[{strat}] ALL-IN SKIPPED {sym}: only ${available:.2f} available')
+                continue
+            notional = available * CASH_PCT
+        else:
+            # All-or-nothing sizing: only enter if at least 95% of the full per-strategy target
+            # is available. Prevents tiny noise trades from rationing capital across strategies.
+            if available < per_strategy_target * 0.95:
+                log(f'[{strat}] BUY SKIPPED {sym}: cash ${available:.2f} below 95% of target ${per_strategy_target:.2f}')
+                continue
+            notional = per_strategy_target * CASH_PCT
 
         stop_price = price - ATR_MULT * a14
         log(f'[{strat}] ENTRY SIGNAL {sym} @ {price:.4f} | {details} | ATR(14)={a14:.4f} stop={stop_price:.4f} notional=${notional:.2f}')
@@ -901,8 +918,10 @@ def process_entry(strat, state, bars_dict, taken_syms, per_strategy_target,
                 'qty': order.get('qty') or order.get('filled_qty'),
             }
             taken_syms.add(sym)
-            tg(f"BUY {sym} @ ${price:.4f}\nStrategy [{strat}]: {STRAT_NAMES[strat]}\nReason: {details}\nATR(14): {a14:.4f}\nStop: ${stop_price:.4f}\nNotional: ${notional:.2f}")
-            return  # one entry per strategy per tick
+            tag = '[ALL-IN] ' if all_in_mode else ''
+            tg(f"{tag}BUY {sym} @ ${price:.4f}\nStrategy [{strat}]: {STRAT_NAMES[strat]}\nReason: {details}\nATR(14): {a14:.4f}\nStop: ${stop_price:.4f}\nNotional: ${notional:.2f}")
+            return True  # one entry per strategy per tick
+    return False
 
 
 def run():
@@ -912,15 +931,25 @@ def run():
     utc_min = now_utc.hour * 60 + now_utc.minute
     market_open_min = 13 * 60 + 30
     market_close_min = 20 * 60
-    no_entry_after_min = market_close_min - 60   # 19:00 UTC — last hour before close, no new stock entries
-    force_close_at_min = market_close_min        # 20:00 UTC — force-close all stocks at market close
+    # Force-close at 19:30 UTC (30 min before market close) — gives orders ~30 min margin
+    # to actually fill in the regular session, avoiding the 403 wall we hit at 20:00.
+    force_close_at_min = market_close_min - 30   # 19:30 UTC
+    # Last-entry window: 15:30–16:00 UTC. Normal stock entries fire 13:30–15:30 UTC. From
+    # 15:30 UTC, only the all-in path can place a stock entry, and only one strategy total
+    # fires inside this 30-min window — it takes all available cash. After 16:00 UTC, no
+    # new STOCK entries until the next stock-market open at 13:30 UTC. (BTC stays 24/7.)
+    last_entry_window_start = 15 * 60 + 30        # 15:30 UTC
+    last_entry_window_end   = 16 * 60             # 16:00 UTC
     is_weekend = now_utc.weekday() >= 5
     market_open = (not is_weekend) and market_open_min <= utc_min < market_close_min
-    block_new_stock_entries = (not market_open) or utc_min >= no_entry_after_min
-    # Force-close fires for 30-minute window starting at 20:00 UTC. Orders queue if market is closed
-    # (paper trading) and fill at the next day's market open via Alpaca's queue.
+    in_last_entry_window = (not is_weekend) and last_entry_window_start <= utc_min < last_entry_window_end
+    # Block normal stock entries when market is closed OR once the last-entry window has begun
+    # (only the all-in entry path can fire during the window). After 16:00 UTC, stock entries
+    # remain blocked all the way until the next 13:30 UTC.
+    block_new_stock_entries = (not market_open) or utc_min >= last_entry_window_start
+    # Force-close fires from 19:30 UTC for 30 min — covers 19:30–20:00 UTC, all in regular hours.
     force_close_stocks = (not is_weekend) and force_close_at_min <= utc_min < (force_close_at_min + 30)
-    log(f'Time: UTC={now_utc:%H:%M} marketOpen={market_open} blockStockEntries={block_new_stock_entries} forceCloseStocks={force_close_stocks}')
+    log(f'Time: UTC={now_utc:%H:%M} marketOpen={market_open} blockStockEntries={block_new_stock_entries} forceCloseStocks={force_close_stocks} lastEntryWindow={in_last_entry_window}')
 
     state = load_state()
     sync_state_with_alpaca(state)
@@ -955,9 +984,19 @@ def run():
     taken_syms = {state[s]['symbol'] for s in ALL_STRATS if state.get(s)}
 
     # Entries
-    for s in ALL_STRATS:
-        process_entry(s, state, bars_dict, taken_syms, per_strategy_target,
-                      block_new_stock_entries, market_open)
+    if in_last_entry_window:
+        # All-in mode: try strategies in order until ONE fires, deploys all cash, and we stop.
+        log(f'[ALL-IN WINDOW] 19:30-20:00 UTC: scanning for first signal to deploy all available cash')
+        for s in ALL_STRATS:
+            placed = process_entry(s, state, bars_dict, taken_syms, per_strategy_target,
+                                   block_new_stock_entries, market_open, all_in_mode=True)
+            if placed:
+                log(f'[ALL-IN WINDOW] [{s}] consumed available cash; halting further entries this tick')
+                break
+    else:
+        for s in ALL_STRATS:
+            process_entry(s, state, bars_dict, taken_syms, per_strategy_target,
+                          block_new_stock_entries, market_open)
 
     save_state(state)
 
