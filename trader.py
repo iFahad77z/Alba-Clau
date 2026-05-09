@@ -1063,7 +1063,7 @@ def send_daily_summary(state, equity_now, is_weekend=False):
     ]
     for s in sorted(by_strat.keys(), key=lambda x: -by_strat[x]['usd']):
         d = by_strat[s]
-        lines.append(f"[{s}] {d['n']} trade{'s' if d['n']!=1 else ''}, {d['w']}-{d['l']}, ${d['usd']:+,.2f} ({d['pct']:+.2f}%)")
+        lines.append(f"[{s}] {d['n']} trade{'s' if d['n']!=1 else ''}, W:{d['w']} L:{d['l']}, ${d['usd']:+,.2f} ({d['pct']:+.2f}%)")
     msg = "\n".join(lines)
     log("DAILY SUMMARY:\n" + msg)
     tg(msg)
