@@ -1041,15 +1041,16 @@ def send_daily_summary(state, equity_now, is_weekend=False):
     losses = n - wins
     realized_usd = sum((t.get('pl_usd') or 0) for t in trades)
 
-    # Per-strategy aggregation
+    # Per-strategy aggregation (n trades, wins, losses, $ realized, total % return)
     by_strat = {}
     for t in trades:
         s = t['strat']
-        d = by_strat.setdefault(s, {'n': 0, 'w': 0, 'l': 0, 'usd': 0.0})
+        d = by_strat.setdefault(s, {'n': 0, 'w': 0, 'l': 0, 'usd': 0.0, 'pct': 0.0})
         d['n'] += 1
         if (t.get('pl_pct') or 0) > 0: d['w'] += 1
         else: d['l'] += 1
         d['usd'] += (t.get('pl_usd') or 0)
+        d['pct'] += (t.get('pl_pct') or 0)
 
     no_trade_msg = "No BTC trades closed today." if is_weekend else "No trades closed today."
     lines = [
@@ -1062,7 +1063,7 @@ def send_daily_summary(state, equity_now, is_weekend=False):
     ]
     for s in sorted(by_strat.keys(), key=lambda x: -by_strat[x]['usd']):
         d = by_strat[s]
-        lines.append(f"[{s}] {d['n']} trade{'s' if d['n']!=1 else ''}, {d['w']}-{d['l']}, ${d['usd']:+,.2f}")
+        lines.append(f"[{s}] {d['n']} trade{'s' if d['n']!=1 else ''}, {d['w']}-{d['l']}, ${d['usd']:+,.2f} ({d['pct']:+.2f}%)")
     msg = "\n".join(lines)
     log("DAILY SUMMARY:\n" + msg)
     tg(msg)
