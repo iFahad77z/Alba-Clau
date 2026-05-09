@@ -207,17 +207,29 @@ def tg_error_once(state, key, msg, cooldown_min=60):
 
 
 def get_bars(symbol, is_crypto):
-    start = (datetime.now(timezone.utc) - timedelta(days=10)).strftime('%Y-%m-%dT%H:%M:%SZ')
+    """Fetch the most recent ~500 5-min bars for a symbol.
+
+    NOTE on the previous (broken) behavior:
+        With sort=asc, limit=1000, start=10d-ago, Alpaca returns the FIRST 1000
+        bars in the window. For BTC (288 bars/day), 1000 bars = 3.5 days, so the
+        bot was reading data from 6-10 days ago and missing the last week. Stocks
+        weren't affected (market hours -> only ~390 bars/10d, fits in 1000).
+        Now we use sort=desc (newest first) and reverse to ascending — guarantees
+        the last bar is the current 5-min slot.
+    """
+    start = (datetime.now(timezone.utc) - timedelta(days=4)).strftime('%Y-%m-%dT%H:%M:%SZ')
     if is_crypto:
         url = DATA_CRYPTO
-        params = {'symbols': symbol, 'timeframe': '5Min', 'limit': 1000, 'sort': 'asc', 'start': start}
+        params = {'symbols': symbol, 'timeframe': '5Min', 'limit': 500, 'sort': 'desc', 'start': start}
     else:
         url = DATA_STOCKS
-        params = {'symbols': symbol, 'timeframe': '5Min', 'limit': 1000, 'sort': 'asc', 'start': start, 'feed': 'iex'}
+        params = {'symbols': symbol, 'timeframe': '5Min', 'limit': 500, 'sort': 'desc', 'start': start, 'feed': 'iex'}
     try:
         r = requests.get(url, headers=HEADERS, params=params, timeout=20)
         r.raise_for_status()
-        return r.json().get('bars', {}).get(symbol, [])
+        bars = r.json().get('bars', {}).get(symbol, [])
+        # API returned newest-first; reverse to ascending so [-1] is the current bar.
+        return list(reversed(bars))
     except Exception as e:
         log(f'ERROR fetching {symbol}: {e}')
         return []
