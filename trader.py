@@ -185,6 +185,21 @@ def tg(msg):
         log(f'TG send failed: {e}')
 
 
+def tg_error_once(state, key, msg, cooldown_min=60):
+    """Send a Telegram error notification, deduped per (key, cooldown window).
+    Prevents spam when a recurring error fires every 5-min cron tick."""
+    if state is None:
+        tg(msg)
+        return
+    notified = state.setdefault('_notified', {})
+    last = notified.get(key, 0)
+    now = datetime.now(timezone.utc).timestamp()
+    if last and (now - last) < cooldown_min * 60:
+        return
+    notified[key] = now
+    tg(msg)
+
+
 def get_bars(symbol, is_crypto):
     start = (datetime.now(timezone.utc) - timedelta(days=10)).strftime('%Y-%m-%dT%H:%M:%SZ')
     if is_crypto:
@@ -875,6 +890,16 @@ def process_exit(strat, state, bars_dict, force_close_stocks):
         if result is None:
             # Close failed (e.g. pending order already exists, market closed, PDT). Keep state to retry next tick.
             log(f'[{strat}] EXIT close failed for {sym}; keeping state to retry on next tick')
+            # Notify Telegram (deduped per symbol per 60 min so we don't spam every 5 min)
+            tg_error_once(
+                state,
+                key=f'close_fail:{sym}',
+                msg=(f"⚠️ Close FAILED for {sym} (strategy [{strat}])\n"
+                     f"Reason: {reason}\n"
+                     f"Likely cause: PDT block, market closed, or duplicate pending order.\n"
+                     f"Bot kept state and will retry every 5 min until success."),
+                cooldown_min=60,
+            )
             return
         notional_in = pos.get('notional')
         est_pl_dollars = (notional_in * pl_pct / 100) if notional_in else None
@@ -971,6 +996,14 @@ def process_entry(strat, state, bars_dict, taken_syms, per_strategy_target,
         stop_price = price - ATR_MULT * a14
         log(f'[{strat}] ENTRY SIGNAL {sym} @ {price:.4f} | {details} | ATR(14)={a14:.4f} stop={stop_price:.4f} notional=${notional:.2f}')
         order = buy_notional(sym, notional, is_crypto)
+        if not order:
+            tg_error_once(
+                state,
+                key=f'buy_fail:{sym}',
+                msg=(f"⚠️ Buy FAILED for {sym} (strategy [{strat}])\n"
+                     f"Notional: ${notional:.2f}\nCheck logs for details."),
+                cooldown_min=60,
+            )
         if order:
             state[strat] = {
                 'symbol': sym,
@@ -1142,4 +1175,13 @@ if __name__ == '__main__':
         run()
     except Exception as e:
         log(f'fatal: {e}')
+        # Best-effort Telegram notification of the crash. Always send (no dedupe)
+        # because fatal errors halt this tick entirely — we want to see every one.
+        try:
+            import traceback
+            tb = traceback.format_exc().splitlines()
+            tail = '\n'.join(tb[-6:])  # last few frames only — keep msg short
+            tg(f"🚨 BOT CRASHED on tick\n{type(e).__name__}: {e}\n\n{tail}")
+        except Exception:
+            pass
         raise
