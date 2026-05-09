@@ -69,6 +69,7 @@ FILTER_VARIANTS = {
     'A2': 'A', 'B2': 'B', 'C2': 'C', 'D2': 'D', 'E2': 'E',
     'G2': 'G', 'H2': 'H', 'I2': 'I', 'J2': 'J',
     'K2': 'K', 'L2': 'L', 'M2': 'M',
+    'X-A2': 'X-A',  # Volume EMA cross + 200 EMA filter
 }
 
 # Trailing-stop variants ("copy 3"): maps "X3" -> base strategy "X". X3 has IDENTICAL
@@ -81,6 +82,7 @@ FILTER_VARIANTS = {
 TRAIL_VARIANTS = {
     'A3': 'A', 'B3': 'B', 'C3': 'C', 'D3': 'D', 'E3': 'E', 'F3': 'F', 'G3': 'G',
     'H3': 'H', 'I3': 'I', 'J3': 'J', 'K3': 'K', 'L3': 'L', 'M3': 'M', 'N3': 'N',
+    'X-A3': 'X-A',  # Volume EMA cross + Trailing Stop
 }
 TRAILING_STOP_STRATS = set(TRAIL_VARIANTS.keys())
 
@@ -88,6 +90,7 @@ ALL_STRATS = (
     'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N',
     'A2', 'B2', 'C2', 'D2', 'E2', 'G2', 'H2', 'I2', 'J2', 'K2', 'L2', 'M2',
     'A3', 'B3', 'C3', 'D3', 'E3', 'F3', 'G3', 'H3', 'I3', 'J3', 'K3', 'L3', 'M3', 'N3',
+    'X-A', 'X-A2', 'X-A3',
 )
 
 STRAT_NAMES = {
@@ -131,6 +134,9 @@ STRAT_NAMES = {
     'L3': 'Slow EMA + TP + Trailing Stop',
     'M3': 'Slow EMA No-Stop + Trailing Stop (no-op for M3 — no stop)',
     'N3': 'RSI Bounce + 200 EMA Trend Filter + Trailing Stop',
+    'X-A':  'Volume-EMA Cross 9/21 (OI proxy)',
+    'X-A2': 'Volume-EMA Cross 9/21 + 200 EMA Filter',
+    'X-A3': 'Volume-EMA Cross 9/21 + Trailing Stop',
 }
 
 
@@ -429,6 +435,28 @@ def signal_ema_cross(bars, fast, slow):
     }
 
 
+def signal_volume_ema_cross(bars, fast=9, slow=21):
+    """Strategy X-A: 9/21 EMA crossover on VOLUME (proxy for Open Interest momentum).
+    Bull when fast EMA crosses above slow EMA AND price has risen on the trigger bar.
+    The price-rise check filters out volume spikes during sell-offs (defensive flow)."""
+    vols = [float(b.get('v', 0)) for b in bars]
+    closes = [float(b['c']) for b in bars]
+    n = len(closes) - 1
+    if n < slow + 1:
+        return None
+    vf = ema_series(vols, fast)
+    vs = ema_series(vols, slow)
+    if any(x is None for x in (vf[n], vs[n], vf[n - 1], vs[n - 1])):
+        return None
+    price_up = closes[n] > closes[n - 1]
+    price_dn = closes[n] < closes[n - 1]
+    return {
+        'bull': vf[n - 1] <= vs[n - 1] and vf[n] > vs[n] and price_up,
+        'bear': vf[n - 1] >= vs[n - 1] and vf[n] < vs[n] and price_dn,
+        'fast_v': vf[n], 'slow_v': vs[n], 'price': closes[n],
+    }
+
+
 def signal_donchian(bars, period=DONCHIAN_PERIOD, exit_period=DONCHIAN_EXIT_PERIOD):
     highs = [float(b['h']) for b in bars]
     lows = [float(b['l']) for b in bars]
@@ -671,7 +699,8 @@ STOCK_ONLY_STRATS = {'H', 'I'}
 
 def get_entry_signal(strat, bars, sym, is_crypto):
     """Returns (fired: bool, details: str, extra: dict) or (False, '', {}).
-    Filter variants (X2) delegate to the base strategy, then apply 200 EMA filter."""
+    Filter variants (X2) delegate to the base then add a 200 EMA filter.
+    Trailing variants (X3) delegate to the base with no signal change (only stop differs)."""
     if strat in FILTER_VARIANTS:
         base = FILTER_VARIANTS[strat]
         fired, details, extra = _get_entry_signal_base(base, bars, sym, is_crypto)
@@ -685,6 +714,9 @@ def get_entry_signal(strat, bars, sym, is_crypto):
             return False, '', {}
         details += f" + price>200EMA ({closes[n]:.4f}>{e200[n]:.4f})"
         return True, details, extra
+    if strat in TRAIL_VARIANTS:
+        # Trailing-stop twin: same entry as base. Stop ratchet is applied in process_exit.
+        return _get_entry_signal_base(TRAIL_VARIANTS[strat], bars, sym, is_crypto)
     return _get_entry_signal_base(strat, bars, sym, is_crypto)
 
 
@@ -751,6 +783,13 @@ def _get_entry_signal_base(strat, bars, sym, is_crypto):
             n = len(closes) - 1
             if e200[n] is not None and closes[n] > e200[n]:
                 return True, f"RSI bounce + price>200EMA | RSI {sig_rsi['rsi_prev']:.1f}->{sig_rsi['rsi']:.1f} | price {closes[n]:.4f} > 200EMA {e200[n]:.4f}", sig_rsi
+    elif strat == 'X-A':
+        # Volume-EMA cross 9/21 (Open Interest proxy). Bull when 9-EMA of volume crosses
+        # above 21-EMA of volume AND price is up on the trigger bar — captures money-flow
+        # acceleration confirmed by price direction.
+        sig = signal_volume_ema_cross(bars, 9, 21)
+        if sig and sig['bull']:
+            return True, f"Vol-EMA bull cross (OI proxy) | 9volEMA={sig['fast_v']:.0f} 21volEMA={sig['slow_v']:.0f} | price={sig['price']:.4f}", sig
     return False, '', {}
 
 
@@ -758,6 +797,8 @@ def get_exit_signal(strat, bars, pos):
     """Returns (should_exit: bool, reason: str). Variants share exit logic with their base."""
     if strat in FILTER_VARIANTS:
         return _get_exit_signal_base(FILTER_VARIANTS[strat], bars, pos)
+    if strat in TRAIL_VARIANTS:
+        return _get_exit_signal_base(TRAIL_VARIANTS[strat], bars, pos)
     return _get_exit_signal_base(strat, bars, pos)
 
 
@@ -829,6 +870,11 @@ def _get_exit_signal_base(strat, bars, pos):
         sig = signal_rsi(bars)
         if sig and sig['overbought']:
             return True, f"RSI overbought ({sig['rsi']:.1f})"
+    elif strat == 'X-A':
+        # Exit on bearish volume-EMA cross (9 below 21) — money flow fading.
+        sig = signal_volume_ema_cross(bars, 9, 21)
+        if sig and sig['bear']:
+            return True, f"Vol-EMA bear cross (9volEMA={sig['fast_v']:.0f} <= 21volEMA={sig['slow_v']:.0f})"
     return False, ''
 
 
