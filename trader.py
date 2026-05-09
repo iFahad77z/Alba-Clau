@@ -990,7 +990,11 @@ def process_entry(strat, state, bars_dict, taken_syms, per_strategy_target,
         return False  # already holding
 
     for sym, is_crypto in WATCHLIST:
-        if sym in taken_syms:
+        # Single-symbol lock applies to STOCKS only — prevents 30+ strategies all piling
+        # into the same ticker at the same tick. BTC is exempt: multiple strategies may
+        # hold BTC simultaneously, each with its own per-strategy cash slice. This gives
+        # weekend BTC trading enough breadth to actually generate signal data.
+        if sym in taken_syms and not is_crypto:
             continue
         # Skip blacklisted chronic losers (existing positions still exit normally).
         if sym in BLACKLIST:
@@ -1073,7 +1077,10 @@ def process_entry(strat, state, bars_dict, taken_syms, per_strategy_target,
                 'order_id': order['id'],
                 'qty': order.get('qty') or order.get('filled_qty'),
             }
-            taken_syms.add(sym)
+            # Lock the symbol against other strategies in the same tick — but only for stocks.
+            # BTC stays unlocked so multiple strategies can hold it concurrently (see check above).
+            if not is_crypto:
+                taken_syms.add(sym)
             tag = '[ALL-IN] ' if all_in_mode else ''
             tg(f"{tag}BUY {sym} @ ${price:.4f}\nStrategy [{strat}]: {STRAT_NAMES[strat]}\nReason: {details}\nATR(14): {a14:.4f}\nStop: ${stop_price:.4f}\nNotional: ${notional:.2f}")
             return True  # one entry per strategy per tick
