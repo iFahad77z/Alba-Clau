@@ -273,7 +273,10 @@ def get_account():
 
 
 def get_alpaca_positions():
-    """Returns dict of {symbol: position_dict}. BTCUSD normalized to BTC/USD."""
+    """Returns dict of {symbol: position_dict}. BTCUSD normalized to BTC/USD.
+    Returns None on API failure (timeout, network error) so callers can distinguish
+    'no positions' from 'unknown — cannot rely on this result'. Returning {} on error
+    used to cause sync_state_with_alpaca to wipe all state slots."""
     try:
         r = requests.get(f'{TRADE_BASE}/positions', headers=HEADERS, timeout=15)
         r.raise_for_status()
@@ -286,12 +289,21 @@ def get_alpaca_positions():
         return out
     except Exception as e:
         log(f'ERROR positions: {e}')
-        return {}
+        return None  # sentinel: API failed, caller must NOT treat as "no positions"
 
 
 def sync_state_with_alpaca(state):
-    """Drop any state entries for positions that no longer exist on Alpaca (manual closes etc.)."""
-    alpaca_syms = set(get_alpaca_positions().keys())
+    """Drop any state entries for positions that no longer exist on Alpaca (manual closes etc.).
+
+    SAFETY: if the Alpaca positions API fails (timeout / network), get_alpaca_positions()
+    returns None. We must NOT clear any state in that case — a transient API failure
+    previously wiped multiple strategy slots and triggered an orphan-claim collapse that
+    consolidated multi-strategy positions into a single slot."""
+    positions = get_alpaca_positions()
+    if positions is None:
+        log('STATE SYNC SKIPPED: positions API unavailable, preserving state for retry next tick')
+        return
+    alpaca_syms = set(positions.keys())
     for s in ALL_STRATS:
         pos = state.get(s)
         if pos and pos.get('symbol') not in alpaca_syms:
@@ -1283,7 +1295,10 @@ def run():
 
     # Claim any orphan Alpaca positions (existing positions that no strategy is tracking)
     alpaca_positions_now = get_alpaca_positions()
-    claim_orphan_positions(state, bars_dict, alpaca_positions_now)
+    if alpaca_positions_now is None:
+        log('ORPHAN CLAIM SKIPPED: positions API unavailable')
+    else:
+        claim_orphan_positions(state, bars_dict, alpaca_positions_now)
 
     # Exits first
     for s in ALL_STRATS:
