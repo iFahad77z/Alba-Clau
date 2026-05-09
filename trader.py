@@ -1022,12 +1022,19 @@ def process_entry(strat, state, bars_dict, taken_syms, per_strategy_target,
     return False
 
 
-def send_daily_summary(state, equity_now):
+def send_daily_summary(state, equity_now, is_weekend=False):
     daily = state.get('_daily') or {}
     trades = daily.get('trades', [])
     start_eq = daily.get('start_equity')
     eq_change_usd = (equity_now - start_eq) if (start_eq is not None) else None
     eq_change_pct = (eq_change_usd / start_eq * 100) if (start_eq and eq_change_usd is not None) else None
+
+    # On weekends, only BTC trades exist. Filter to BTC-only and label the summary.
+    if is_weekend:
+        trades = [t for t in trades if t.get('sym') == 'BTC/USD']
+        title = f"📊 Weekend BTC Summary — {daily.get('date','?')}"
+    else:
+        title = f"📊 Daily Summary — {daily.get('date','?')}"
 
     n = len(trades)
     wins = sum(1 for t in trades if (t.get('pl_pct') or 0) > 0)
@@ -1044,13 +1051,14 @@ def send_daily_summary(state, equity_now):
         else: d['l'] += 1
         d['usd'] += (t.get('pl_usd') or 0)
 
+    no_trade_msg = "No BTC trades closed today." if is_weekend else "No trades closed today."
     lines = [
-        f"📊 Daily Summary — {daily.get('date','?')}",
+        title,
         f"Equity: ${equity_now:,.2f}" + (f" ({eq_change_pct:+.2f}%, ${eq_change_usd:+,.2f})" if eq_change_pct is not None else ""),
         f"Trades: {n}  W-L: {wins}-{losses}" + (f" ({wins/n*100:.0f}% win)" if n else ""),
         f"Realized: ${realized_usd:+,.2f}",
         "",
-        "Per-strategy:" if by_strat else "No trades closed today.",
+        "Per-strategy:" if by_strat else no_trade_msg,
     ]
     for s in sorted(by_strat.keys(), key=lambda x: -by_strat[x]['usd']):
         d = by_strat[s]
@@ -1061,10 +1069,9 @@ def send_daily_summary(state, equity_now):
 
 
 def maybe_send_daily_summary(state, utc_min, is_weekend, equity_now):
-    """Send daily summary at 19:40 UTC if all stocks are flat, else fall back to 20:00 UTC.
-    Only sends once per UTC date. Skipped on weekends."""
-    if is_weekend:
-        return
+    """Send daily summary once per UTC date.
+    * Weekdays: 19:40 UTC if all stocks are flat, else fallback at 20:00 UTC.
+    * Weekends: 20:00 UTC, BTC-only trades (stocks don't trade on weekends)."""
     daily = state.setdefault('_daily', {'date': '', 'sent': False, 'trades': [], 'start_equity': None})
     today = datetime.now(timezone.utc).date().isoformat()
     if daily.get('date') != today:
@@ -1075,7 +1082,15 @@ def maybe_send_daily_summary(state, utc_min, is_weekend, equity_now):
         daily['start_equity'] = equity_now
     if daily.get('sent'):
         return
-    # Determine if all stocks are flat
+
+    if is_weekend:
+        # Weekend BTC-only summary at 20:00 UTC. (No early/late branching since stocks don't matter.)
+        if (20*60) <= utc_min < (20*60 + 5):
+            send_daily_summary(state, equity_now, is_weekend=True)
+            daily['sent'] = True
+        return
+
+    # Weekday path
     all_stocks_flat = True
     for s in ALL_STRATS:
         p = state.get(s)
@@ -1085,7 +1100,7 @@ def maybe_send_daily_summary(state, utc_min, is_weekend, equity_now):
     early_window  = (19*60 + 40) <= utc_min < (19*60 + 45)
     late_fallback = (20*60)      <= utc_min < (20*60 + 5)
     if (early_window and all_stocks_flat) or late_fallback:
-        send_daily_summary(state, equity_now)
+        send_daily_summary(state, equity_now, is_weekend=False)
         daily['sent'] = True
 
 
