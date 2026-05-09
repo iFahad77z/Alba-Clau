@@ -965,7 +965,7 @@ def process_exit(strat, state, bars_dict, force_close_stocks):
             tg(f"SELL {sym}\nStrategy [{strat}]: {STRAT_NAMES[strat]}\nReason: {reason}\nEntry: ${entry:.4f}\nExit (approx): ${price:.4f}\nNotional: ${notional_in:.2f}\nEst P/L: {pl_pct:+.2f}% (~${est_pl_dollars:+.2f})")
         else:
             tg(f"SELL {sym}\nStrategy [{strat}]: {STRAT_NAMES[strat]}\nReason: {reason}\nEntry: ${entry:.4f}\nExit (approx): ${price:.4f}\nEst P/L: {pl_pct:+.2f}%")
-        # Record trade for daily summary AND lifetime stats
+        # Record trade for daily, weekly, and lifetime stats
         daily = state.setdefault('_daily', {'date': '', 'sent': False, 'trades': [], 'start_equity': None})
         trade_rec = {
             'strat': strat, 'sym': sym, 'pl_pct': round(pl_pct, 2),
@@ -973,6 +973,14 @@ def process_exit(strat, state, bars_dict, force_close_stocks):
             'reason': reason,
         }
         daily.setdefault('trades', []).append(trade_rec)
+        # Weekly trades — rolling Monday-to-Sunday window in UTC
+        weekly = state.setdefault('_weekly', {'week_start': '', 'trades': []})
+        now_dt = datetime.now(timezone.utc).date()
+        monday = (now_dt - timedelta(days=now_dt.weekday())).isoformat()
+        if weekly.get('week_start') != monday:
+            weekly['week_start'] = monday
+            weekly['trades'] = []
+        weekly.setdefault('trades', []).append(trade_rec)
         # Lifetime cumulative stats per strategy (never resets)
         lifetime = state.setdefault('_lifetime', {})
         d = lifetime.setdefault(strat, {'n': 0, 'w': 0, 'l': 0, 'usd': 0.0, 'pct': 0.0})
@@ -1123,12 +1131,23 @@ def send_daily_summary(state, equity_now, is_weekend=False):
         d['usd'] += (t.get('pl_usd') or 0)
         d['pct'] += (t.get('pl_pct') or 0)
 
+    # Weekly realized — sum from state['_weekly']['trades'] (rolling Mon-Sun)
+    weekly = state.get('_weekly') or {}
+    weekly_trades = weekly.get('trades', [])
+    if is_weekend:
+        weekly_trades = [t for t in weekly_trades if t.get('sym') == 'BTC/USD']
+    weekly_n = len(weekly_trades)
+    weekly_wins = sum(1 for t in weekly_trades if (t.get('pl_pct') or 0) > 0)
+    weekly_realized = sum((t.get('pl_usd') or 0) for t in weekly_trades)
+    week_start_str = weekly.get('week_start', '?')
+
     no_trade_msg = "No BTC trades closed today." if is_weekend else "No trades closed today."
     lines = [
         title,
         f"Equity: ${equity_now:,.2f}" + (f" ({eq_change_pct:+.2f}%, ${eq_change_usd:+,.2f})" if eq_change_pct is not None else ""),
         f"Trades: {n}  W-L: {wins}-{losses}" + (f" ({wins/n*100:.0f}% win)" if n else ""),
-        f"Realized: ${realized_usd:+,.2f}",
+        f"Realized today: ${realized_usd:+,.2f}",
+        f"Realized this week: ${weekly_realized:+,.2f} ({weekly_n} trade{'s' if weekly_n!=1 else ''}, W-L: {weekly_wins}-{weekly_n-weekly_wins}, since {week_start_str})",
         "",
         "Today's per-strategy:" if by_strat else no_trade_msg,
     ]
