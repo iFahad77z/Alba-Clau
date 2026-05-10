@@ -70,6 +70,7 @@ FILTER_VARIANTS = {
     'G2': 'G', 'H2': 'H', 'I2': 'I', 'J2': 'J',
     'K2': 'K', 'L2': 'L', 'M2': 'M',
     'X-A2': 'X-A',  # Volume EMA cross + 200 EMA filter
+    'X-K2': 'X-K',   # BB+RSI reversal + 200 EMA filter
 }
 
 # Trailing-stop variants ("copy 3"): maps "X3" -> base strategy "X". X3 has IDENTICAL
@@ -83,6 +84,7 @@ TRAIL_VARIANTS = {
     'A3': 'A', 'B3': 'B', 'C3': 'C', 'D3': 'D', 'E3': 'E', 'F3': 'F', 'G3': 'G',
     'H3': 'H', 'I3': 'I', 'J3': 'J', 'K3': 'K', 'L3': 'L', 'M3': 'M', 'N3': 'N',
     'X-A3': 'X-A',  # Volume EMA cross + Trailing Stop
+    'X-K3': 'X-K',   # BB+RSI reversal + Trailing Stop
 }
 TRAILING_STOP_STRATS = set(TRAIL_VARIANTS.keys())
 
@@ -91,6 +93,7 @@ ALL_STRATS = (
     'A2', 'B2', 'C2', 'D2', 'E2', 'G2', 'H2', 'I2', 'J2', 'K2', 'L2', 'M2',
     'A3', 'B3', 'C3', 'D3', 'E3', 'F3', 'G3', 'H3', 'I3', 'J3', 'K3', 'L3', 'M3', 'N3',
     'X-A', 'X-A2', 'X-A3',
+    'X-K', 'X-K2', 'X-K3',
 )
 
 STRAT_NAMES = {
@@ -137,6 +140,9 @@ STRAT_NAMES = {
     'X-A':  'Volume-EMA Cross 9/21 (OI proxy)',
     'X-A2': 'Volume-EMA Cross 9/21 + 200 EMA Filter',
     'X-A3': 'Volume-EMA Cross 9/21 + Trailing Stop',
+    'X-K':  'Bollinger + RSI Reversal (RSI cross up 20 + wick below lower BB; exit RSI cross down 80)',
+    'X-K2': 'Bollinger + RSI Reversal + 200 EMA Filter',
+    'X-K3': 'Bollinger + RSI Reversal + Trailing Stop',
 }
 
 
@@ -456,6 +462,64 @@ def signal_ema_cross(bars, fast, slow):
         'bull': ef[n - 1] <= es[n - 1] and ef[n] > es[n],
         'bear': ef[n - 1] >= es[n - 1] and ef[n] < es[n],
         'fast': ef[n], 'slow': es[n], 'price': closes[n],
+    }
+
+
+def signal_bb_rsi_reversal(bars, bb_period=BB_PERIOD, bb_std=BB_STD,
+                           rsi_period=RSI_PERIOD, rsi_low=20, rsi_high=80):
+    """Strategy O: Deep Bollinger + RSI reversal.
+
+    ENTRY (bull) — both must be true on the trigger bar:
+      1) RSI crossed UP through 20: rsi_prev < 20 AND rsi_now >= 20
+      2) The bar's low pierced below the lower Bollinger Band but the close
+         came back above it (wick rejection): low <= lower_bb AND close > lower_bb
+
+    EXIT (bear): RSI crossed DOWN through 80: rsi_prev > 80 AND rsi_now <= 80
+    """
+    closes = [float(b['c']) for b in bars]
+    lows   = [float(b['l']) for b in bars]
+    n = len(closes) - 1
+    if n < max(bb_period, rsi_period) + 2:
+        return None
+
+    # Bollinger lower band at the current bar
+    win = closes[n - bb_period + 1:n + 1]
+    m = sum(win) / bb_period
+    v = sum((c - m) ** 2 for c in win) / bb_period
+    s = v ** 0.5
+    lower_now = m - bb_std * s
+
+    # RSI now and prev
+    deltas = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
+    gains = [max(d, 0) for d in deltas]
+    losses = [-min(d, 0) for d in deltas]
+    if len(gains) < rsi_period + 1:
+        return None
+
+    def rsi_at(end_idx_in_deltas):
+        ag = sum(gains[:rsi_period]) / rsi_period
+        al = sum(losses[:rsi_period]) / rsi_period
+        for i in range(rsi_period, end_idx_in_deltas + 1):
+            ag = (ag * (rsi_period - 1) + gains[i]) / rsi_period
+            al = (al * (rsi_period - 1) + losses[i]) / rsi_period
+        if al == 0:
+            return 100
+        rs = ag / al
+        return 100 - 100 / (1 + rs)
+
+    rsi_now  = rsi_at(len(gains) - 1)
+    rsi_prev = rsi_at(len(gains) - 2)
+
+    rsi_cross_up_20   = rsi_prev < rsi_low and rsi_now >= rsi_low
+    rsi_cross_down_80 = rsi_prev > rsi_high and rsi_now <= rsi_high
+    wick_below_bb = lows[n] <= lower_now and closes[n] > lower_now
+
+    return {
+        'bull': rsi_cross_up_20 and wick_below_bb,
+        'bear': rsi_cross_down_80,
+        'rsi': rsi_now, 'rsi_prev': rsi_prev,
+        'lower_bb': lower_now, 'low': lows[n], 'close': closes[n],
+        'price': closes[n],
     }
 
 
@@ -814,6 +878,13 @@ def _get_entry_signal_base(strat, bars, sym, is_crypto):
         sig = signal_volume_ema_cross(bars, 9, 21)
         if sig and sig['bull']:
             return True, f"Vol-EMA bull cross (OI proxy) | 9volEMA={sig['fast_v']:.0f} 21volEMA={sig['slow_v']:.0f} | price={sig['price']:.4f}", sig
+    elif strat == 'X-K':
+        # Bollinger + RSI deep-reversal: RSI just crossed up through 20 AND the bar wicked
+        # below the lower BB but closed back above it. Catches capitulation bounces.
+        sig = signal_bb_rsi_reversal(bars)
+        if sig and sig['bull']:
+            return True, (f"BB+RSI reversal | RSI {sig['rsi_prev']:.1f}->{sig['rsi']:.1f} crossed up 20 "
+                          f"| low={sig['low']:.4f} <= lowerBB={sig['lower_bb']:.4f} < close={sig['close']:.4f}"), sig
     return False, '', {}
 
 
@@ -899,6 +970,11 @@ def _get_exit_signal_base(strat, bars, pos):
         sig = signal_volume_ema_cross(bars, 9, 21)
         if sig and sig['bear']:
             return True, f"Vol-EMA bear cross (9volEMA={sig['fast_v']:.0f} <= 21volEMA={sig['slow_v']:.0f})"
+    elif strat == 'X-K':
+        # Exit only on RSI crossing down through 80 (deep overbought reversal).
+        sig = signal_bb_rsi_reversal(bars)
+        if sig and sig['bear']:
+            return True, f"RSI cross-down 80 (RSI {sig['rsi_prev']:.1f}->{sig['rsi']:.1f})"
     return False, ''
 
 
@@ -1235,9 +1311,10 @@ def maybe_send_morning_summary(state, utc_min, utc_hour, equity_now, is_weekend)
 
 
 def maybe_send_daily_summary(state, utc_min, is_weekend, equity_now):
-    """Send daily summary once per UTC date.
+    """Send the EVENING daily summary once per UTC date.
     * Weekdays: 19:40 UTC if all stocks are flat, else fallback at 20:00 UTC.
-    * Weekends: 20:00 UTC, BTC-only trades (stocks don't trade on weekends)."""
+    * Weekends: 20:00 UTC, BTC-only trades.
+    The morning summary (07:00 UTC) is handled separately by maybe_send_morning_summary."""
     daily = state.setdefault('_daily', {'date': '', 'sent': False, 'trades': [], 'start_equity': None})
     today = datetime.now(timezone.utc).date().isoformat()
     if daily.get('date') != today:
@@ -1250,13 +1327,11 @@ def maybe_send_daily_summary(state, utc_min, is_weekend, equity_now):
         return
 
     if is_weekend:
-        # Weekend BTC-only summary at 20:00 UTC. (No early/late branching since stocks don't matter.)
         if (20*60) <= utc_min < (20*60 + 5):
             send_daily_summary(state, equity_now, is_weekend=True)
             daily['sent'] = True
         return
 
-    # Weekday path
     all_stocks_flat = True
     for s in ALL_STRATS:
         p = state.get(s)
@@ -1268,6 +1343,7 @@ def maybe_send_daily_summary(state, utc_min, is_weekend, equity_now):
     if (early_window and all_stocks_flat) or late_fallback:
         send_daily_summary(state, equity_now, is_weekend=False)
         daily['sent'] = True
+        daily['sent_evening'] = True
 
 
 def run():
