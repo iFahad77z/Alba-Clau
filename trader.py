@@ -1122,7 +1122,7 @@ def process_entry(strat, state, bars_dict, taken_syms, per_strategy_target,
     return False
 
 
-def send_daily_summary(state, equity_now, is_weekend=False):
+def send_daily_summary(state, equity_now, is_weekend=False, morning=False):
     daily = state.get('_daily') or {}
     trades = daily.get('trades', [])
     start_eq = daily.get('start_equity')
@@ -1133,6 +1133,8 @@ def send_daily_summary(state, equity_now, is_weekend=False):
     if is_weekend:
         trades = [t for t in trades if t.get('sym') == 'BTC/USD']
         title = f"📊 Weekend BTC Summary — {daily.get('date','?')}"
+    elif morning:
+        title = f"🌅 Morning Summary — {daily.get('date','?')} 07:00 UTC"
     else:
         title = f"📊 Daily Summary — {daily.get('date','?')}"
 
@@ -1216,6 +1218,20 @@ def send_daily_summary(state, equity_now, is_weekend=False):
         tg(parts[0].rstrip())
         if len(parts) > 1:
             tg("Lifetime (since deploy):" + parts[1])
+
+
+def maybe_send_morning_summary(state, utc_min, utc_hour, equity_now, is_weekend):
+    """Send a morning recap at 07:00–07:04 UTC every day (weekday and weekend).
+    Uses today's daily['trades'] which at 7 AM contains only overnight BTC activity
+    (since daily resets at midnight UTC). Independent of the end-of-day summary —
+    has its own 'sent' tracker so both fire in the same UTC date."""
+    if utc_hour != 7 or utc_min >= 5:
+        return
+    today = datetime.now(timezone.utc).date().isoformat()
+    if state.get('_morning_sent_date') == today:
+        return
+    state['_morning_sent_date'] = today
+    send_daily_summary(state, equity_now, is_weekend=is_weekend, morning=True)
 
 
 def maybe_send_daily_summary(state, utc_min, is_weekend, equity_now):
@@ -1331,8 +1347,9 @@ def run():
             process_entry(s, state, bars_dict, taken_syms, per_strategy_target,
                           block_new_stock_entries, market_open)
 
-    # Fix the all-in window log message (window is now 15:30-16:00 UTC; older log line was stale)
-    # Daily summary: 19:40 UTC if all stocks flat, else fallback at 20:00 UTC.
+    # Morning summary: 07:00 UTC every day (overnight recap, focuses on BTC since stocks closed)
+    maybe_send_morning_summary(state, utc_min, now_utc.hour, equity, is_weekend)
+    # Daily summary: 19:40 UTC if all stocks flat, else fallback at 20:00 UTC. Weekend: 20:00 UTC BTC-only.
     maybe_send_daily_summary(state, utc_min, is_weekend, equity)
 
     save_state(state)
