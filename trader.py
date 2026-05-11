@@ -223,13 +223,18 @@ def get_bars(symbol, is_crypto):
         Now we use sort=desc (newest first) and reverse to ascending — guarantees
         the last bar is the current 5-min slot.
     """
-    start = (datetime.now(timezone.utc) - timedelta(days=4)).strftime('%Y-%m-%dT%H:%M:%SZ')
+    # Different lookback per asset class:
+    # - Crypto: 4 days back at 288 bars/day = ~1152 bars total, fetch newest 500 (~42h).
+    # - Stocks: market is only open 6.5h/day, and the IEX free feed is sparse (~160 bars
+    #   in 4 trading days). Need 10 calendar days to comfortably get >250 bars for 200 EMA.
     if is_crypto:
+        start = (datetime.now(timezone.utc) - timedelta(days=4)).strftime('%Y-%m-%dT%H:%M:%SZ')
         url = DATA_CRYPTO
         params = {'symbols': symbol, 'timeframe': '5Min', 'limit': 500, 'sort': 'desc', 'start': start}
     else:
+        start = (datetime.now(timezone.utc) - timedelta(days=10)).strftime('%Y-%m-%dT%H:%M:%SZ')
         url = DATA_STOCKS
-        params = {'symbols': symbol, 'timeframe': '5Min', 'limit': 500, 'sort': 'desc', 'start': start, 'feed': 'iex'}
+        params = {'symbols': symbol, 'timeframe': '5Min', 'limit': 1000, 'sort': 'desc', 'start': start, 'feed': 'iex'}
     try:
         r = requests.get(url, headers=HEADERS, params=params, timeout=20)
         r.raise_for_status()
@@ -1391,8 +1396,12 @@ def run():
     bars_dict = {}
     for sym, is_crypto in WATCHLIST:
         bars = get_bars(sym, is_crypto)
-        if bars and len(bars) >= 250:
+        # Need enough history for 200-EMA based filters/strategies. 220 gives
+        # 200 EMA convergence + room for cross detection on the trigger bar.
+        if bars and len(bars) >= 220:
             bars_dict[sym] = bars
+        elif bars:
+            log(f'SKIP {sym}: only {len(bars)} bars available (need >=220)')
 
     # Claim any orphan Alpaca positions (existing positions that no strategy is tracking)
     alpaca_positions_now = get_alpaca_positions()
