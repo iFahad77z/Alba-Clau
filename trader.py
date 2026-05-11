@@ -448,6 +448,16 @@ def close_position(symbol, qty=None):
             d = r.json()
             log(f"ORDER PLACED SELL ALL {symbol} qty={d.get('qty')} id={d.get('id')} status={d.get('status')}")
             return d
+    except requests.HTTPError as e:
+        # Capture the response body — Alpaca's 403 body has the actual reason
+        # ('insufficient qty', 'pdt block', 'pending order conflict', etc.).
+        body = ''
+        try:
+            body = e.response.text[:300] if e.response is not None else ''
+        except Exception:
+            pass
+        log(f'ORDER FAILED SELL {symbol}: {e} body={body}')
+        return None
     except Exception as e:
         log(f'ORDER FAILED SELL {symbol}: {e}')
         return None
@@ -1071,10 +1081,37 @@ def process_exit(strat, state, bars_dict, force_close_stocks):
     if should_exit:
         pl_pct = (price - entry) / entry * 100
         log(f'[{strat}] EXIT {sym}: {reason} | entry={entry:.4f} exit~{price:.4f} estP/L={pl_pct:+.2f}%')
-        # Use partial close if multiple strategies hold the same symbol; otherwise full close
+        # Use partial close if multiple strategies hold the same symbol; otherwise full close.
         same_sym_count = sum(1 for s, p in state.items() if p and p.get('symbol') == sym)
         if same_sym_count > 1 and pos.get('qty'):
-            result = close_position(sym, qty=pos['qty'])
+            # Query Alpaca for live qty_available — never request more than is actually
+            # sellable RIGHT NOW (other strategies' pending sells reduce qty_available).
+            positions = get_alpaca_positions()
+            if positions is None:
+                log(f'[{strat}] EXIT close skipped for {sym}: positions API unavailable, keeping state')
+                return
+            apos = positions.get(sym)
+            if not apos:
+                # Position vanished from Alpaca (manual close, prior force close, etc.).
+                # Clear state and don't send an order — there's nothing to sell.
+                log(f'[{strat}] EXIT cleared {sym}: no Alpaca position to sell against')
+                state[strat] = None
+                return
+            qty_avail = float(apos.get('qty_available', 0))
+            if qty_avail <= 1e-9:
+                log(f'[{strat}] EXIT close skipped for {sym}: qty_available=0 (other strategy pending), retry next tick')
+                return
+            # Cap: never exceed our stored share AND never exceed currently-available qty.
+            requested = float(pos['qty']) if pos.get('qty') else qty_avail / same_sym_count
+            # Take 99% of the cap as a safety margin against float / fee dust
+            sell_qty = min(requested, qty_avail) * 0.999
+            sell_qty = round(sell_qty, 9)
+            if sell_qty < 1e-8:
+                log(f'[{strat}] EXIT cleared {sym}: sell qty too small ({sell_qty})')
+                state[strat] = None
+                return
+            log(f'[{strat}] partial close {sym}: requested={requested:.9f} avail={qty_avail:.9f} -> sending {sell_qty:.9f}')
+            result = close_position(sym, qty=sell_qty)
         else:
             result = close_position(sym)
         if result is None:
