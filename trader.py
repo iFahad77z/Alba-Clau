@@ -88,12 +88,27 @@ TRAIL_VARIANTS = {
 }
 TRAILING_STOP_STRATS = set(TRAIL_VARIANTS.keys())
 
+# Swing-low-stop variants ("copy 4"): same entry as X2 (base + 200 EMA filter),
+# but the stop loss is set at the lowest low of the past SWINGLOW_LOOKBACK bars
+# instead of price - 1.5×ATR. Fires the same entries as X2; just a wider/tighter
+# stop depending on recent price structure.
+SWINGLOW_VARIANTS = {
+    'A4': 'A', 'B4': 'B', 'C4': 'C', 'D4': 'D', 'E4': 'E', 'F4': 'F', 'G4': 'G',
+    'H4': 'H', 'I4': 'I', 'J4': 'J', 'K4': 'K', 'L4': 'L', 'M4': 'M', 'N4': 'N',
+    'X-A4': 'X-A',
+    'X-K4': 'X-K',
+}
+SWINGLOW_STOP_STRATS = set(SWINGLOW_VARIANTS.keys())
+SWINGLOW_LOOKBACK = 20  # bars (100 min on 5-min chart)
+
 ALL_STRATS = (
     'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N',
     'A2', 'B2', 'C2', 'D2', 'E2', 'G2', 'H2', 'I2', 'J2', 'K2', 'L2', 'M2',
     'A3', 'B3', 'C3', 'D3', 'E3', 'F3', 'G3', 'H3', 'I3', 'J3', 'K3', 'L3', 'M3', 'N3',
     'X-A', 'X-A2', 'X-A3',
     'X-K', 'X-K2', 'X-K3',
+    'A4', 'B4', 'C4', 'D4', 'E4', 'F4', 'G4', 'H4', 'I4', 'J4', 'K4', 'L4', 'M4', 'N4',
+    'X-A4', 'X-K4',
 )
 
 STRAT_NAMES = {
@@ -143,15 +158,33 @@ STRAT_NAMES = {
     'X-K':  'Bollinger + RSI Reversal (RSI cross up 20 + wick below lower BB; exit RSI cross down 80)',
     'X-K2': 'Bollinger + RSI Reversal + 200 EMA Filter',
     'X-K3': 'Bollinger + RSI Reversal + Trailing Stop',
+    'A4':   'Fast EMA Cross (9/21) + 200 EMA Filter + Swing-Low Stop',
+    'B4':   'Medium EMA Cross (20/50) + 200 EMA Filter + Swing-Low Stop',
+    'C4':   'Donchian Breakout (20/10) + 200 EMA Filter + Swing-Low Stop',
+    'D4':   'MACD + 200 EMA Filter + Swing-Low Stop',
+    'E4':   'Bollinger Reversion + 200 EMA Filter + Swing-Low Stop',
+    'F4':   'RSI Bounce + 200 EMA Filter + Swing-Low Stop',
+    'G4':   'SuperTrend + 200 EMA Filter + Swing-Low Stop',
+    'H4':   'Opening Range Breakout + 200 EMA Filter + Swing-Low Stop',
+    'I4':   'VWAP Reclaim + 200 EMA Filter + Swing-Low Stop',
+    'J4':   'Inside Bar Breakout + 200 EMA Filter + Swing-Low Stop',
+    'K4':   'Slow EMA (50/200) + 200 EMA Filter + Swing-Low Stop',
+    'L4':   'Slow EMA + TP + 200 EMA Filter + Swing-Low Stop',
+    'M4':   'Slow EMA No-Stop + 200 EMA Filter (swing-low n/a since M skips stops)',
+    'N4':   'RSI Bounce + 200 EMA Filter + Swing-Low Stop',
+    'X-A4': 'Volume-EMA Cross + 200 EMA Filter + Swing-Low Stop',
+    'X-K4': 'BB+RSI Reversal + 200 EMA Filter + Swing-Low Stop',
 }
 
 
 def base_strat(strat):
-    """Map a variant ('A2', 'A3') to its base strategy ('A'). Identity for non-variants."""
+    """Map a variant ('A2', 'A3', 'A4') to its base strategy ('A'). Identity for non-variants."""
     if strat in FILTER_VARIANTS:
         return FILTER_VARIANTS[strat]
     if strat in TRAIL_VARIANTS:
         return TRAIL_VARIANTS[strat]
+    if strat in SWINGLOW_VARIANTS:
+        return SWINGLOW_VARIANTS[strat]
     return strat
 
 # Take-profit thresholds (% gain that triggers exit)
@@ -793,9 +826,13 @@ STOCK_ONLY_STRATS = {'H', 'I'}
 def get_entry_signal(strat, bars, sym, is_crypto):
     """Returns (fired: bool, details: str, extra: dict) or (False, '', {}).
     Filter variants (X2) delegate to the base then add a 200 EMA filter.
-    Trailing variants (X3) delegate to the base with no signal change (only stop differs)."""
-    if strat in FILTER_VARIANTS:
-        base = FILTER_VARIANTS[strat]
+    Trailing variants (X3) delegate to the base with no signal change (only stop differs).
+    Swing-low variants (X4) behave like X2 on entry (200 EMA filter); the stop differs."""
+    if strat in FILTER_VARIANTS or strat in SWINGLOW_VARIANTS:
+        if strat in FILTER_VARIANTS:
+            base = FILTER_VARIANTS[strat]
+        else:
+            base = SWINGLOW_VARIANTS[strat]
         fired, details, extra = _get_entry_signal_base(base, bars, sym, is_crypto)
         if not fired:
             return False, '', {}
@@ -899,6 +936,8 @@ def get_exit_signal(strat, bars, pos):
         return _get_exit_signal_base(FILTER_VARIANTS[strat], bars, pos)
     if strat in TRAIL_VARIANTS:
         return _get_exit_signal_base(TRAIL_VARIANTS[strat], bars, pos)
+    if strat in SWINGLOW_VARIANTS:
+        return _get_exit_signal_base(SWINGLOW_VARIANTS[strat], bars, pos)
     return _get_exit_signal_base(strat, bars, pos)
 
 
@@ -1089,7 +1128,8 @@ def process_exit(strat, state, bars_dict, force_close_stocks):
 
 
 def process_entry(strat, state, bars_dict, taken_syms, per_strategy_target,
-                  block_new_stock_entries, market_open, all_in_mode=False):
+                  block_new_stock_entries, market_open, all_in_mode=False,
+                  block_new_btc_entries=False):
     """
     Returns True if an entry was placed for this strategy this tick, False otherwise.
     If all_in_mode is True, the entry uses ALL available cash (capped to ~95% of the
@@ -1111,7 +1151,11 @@ def process_entry(strat, state, bars_dict, taken_syms, per_strategy_target,
         # this block during the 15:30–16:00 UTC last-entry window.
         if (not is_crypto) and block_new_stock_entries and not all_in_mode:
             continue
-        # BTC: 24/7, no time gating. May also be the all-in pick during 15:30–16:00 UTC.
+        # BTC: time-of-day rule (user policy). Blocked during stock-trading hours so it
+        # only trades AFTER force-close (19:30 UTC weekdays) through the next stock open.
+        # All-in window does not unblock BTC (it sits inside the blocked period).
+        if is_crypto and block_new_btc_entries:
+            continue
         if is_crypto and base_strat(strat) in STOCK_ONLY_STRATS:
             continue  # ORB and VWAP don't apply to crypto
         bars = bars_dict.get(sym)
@@ -1163,8 +1207,25 @@ def process_entry(strat, state, bars_dict, taken_syms, per_strategy_target,
                 continue
             notional = per_strategy_target * CASH_PCT
 
-        stop_price = price - ATR_MULT * a14
-        log(f'[{strat}] ENTRY SIGNAL {sym} @ {price:.4f} | {details} | ATR(14)={a14:.4f} stop={stop_price:.4f} notional=${notional:.2f}')
+        # Stop calculation: X4 variants use the lowest low of the past SWINGLOW_LOOKBACK
+        # bars (chart structure stop). All others use 1.5×ATR (X3 also starts here and
+        # ratchets up in process_exit).
+        if strat in SWINGLOW_STOP_STRATS:
+            recent_lows = [float(b['l']) for b in bars[-SWINGLOW_LOOKBACK:]]
+            swing_low = min(recent_lows) if recent_lows else price
+            # Safety: if swing-low is at or above current price (very rare — only on a brand
+            # new high after a fast rip), fall back to ATR stop so the stop is meaningfully
+            # below entry. Otherwise use the swing-low as-is.
+            if swing_low < price:
+                stop_price = swing_low
+                stop_kind = f"swing-low({SWINGLOW_LOOKBACK}b)"
+            else:
+                stop_price = price - ATR_MULT * a14
+                stop_kind = f"ATR fallback (swing-low {swing_low:.4f} >= price)"
+        else:
+            stop_price = price - ATR_MULT * a14
+            stop_kind = f"ATR(14)×{ATR_MULT}"
+        log(f'[{strat}] ENTRY SIGNAL {sym} @ {price:.4f} | {details} | {stop_kind} stop={stop_price:.4f} notional=${notional:.2f}')
         # Compute the planned qty up front so partial-close (used when multiple strategies
         # share a symbol) has a valid number to send. Notional-based crypto buys come back
         # from Alpaca with qty=null and filled_qty=0 at placement time, so we couldn't rely
@@ -1374,9 +1435,13 @@ def run():
     # (only the all-in entry path can fire during the window). After 16:00 UTC, stock entries
     # remain blocked all the way until the next 13:30 UTC.
     block_new_stock_entries = (not market_open) or utc_min >= last_entry_window_start
+    # BTC time-of-day rule: blocked during stock-trading hours (13:30–19:30 UTC weekdays).
+    # Allowed from 19:30 UTC (force-close start) through the next 13:30 UTC, plus weekends.
+    btc_active_window = is_weekend or utc_min >= force_close_at_min or utc_min < market_open_min
+    block_new_btc_entries = not btc_active_window
     # Force-close fires from 19:30 UTC for 30 min — covers 19:30–20:00 UTC, all in regular hours.
     force_close_stocks = (not is_weekend) and force_close_at_min <= utc_min < (force_close_at_min + 30)
-    log(f'Time: UTC={now_utc:%H:%M} marketOpen={market_open} blockStockEntries={block_new_stock_entries} forceCloseStocks={force_close_stocks} lastEntryWindow={in_last_entry_window}')
+    log(f'Time: UTC={now_utc:%H:%M} marketOpen={market_open} blockStockEntries={block_new_stock_entries} blockBtcEntries={block_new_btc_entries} forceCloseStocks={force_close_stocks} lastEntryWindow={in_last_entry_window}')
 
     state = load_state()
     sync_state_with_alpaca(state)
@@ -1423,14 +1488,16 @@ def run():
         log(f'[ALL-IN WINDOW] 15:30-16:00 UTC: scanning for first signal to deploy all available cash')
         for s in ALL_STRATS:
             placed = process_entry(s, state, bars_dict, taken_syms, per_strategy_target,
-                                   block_new_stock_entries, market_open, all_in_mode=True)
+                                   block_new_stock_entries, market_open, all_in_mode=True,
+                                   block_new_btc_entries=block_new_btc_entries)
             if placed:
                 log(f'[ALL-IN WINDOW] [{s}] consumed available cash; halting further entries this tick')
                 break
     else:
         for s in ALL_STRATS:
             process_entry(s, state, bars_dict, taken_syms, per_strategy_target,
-                          block_new_stock_entries, market_open)
+                          block_new_stock_entries, market_open,
+                          block_new_btc_entries=block_new_btc_entries)
 
     # Morning summary: 07:00 UTC every day (overnight recap, focuses on BTC since stocks closed)
     maybe_send_morning_summary(state, utc_min, now_utc.hour, equity, is_weekend)
