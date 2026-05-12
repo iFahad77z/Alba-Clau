@@ -1440,6 +1440,100 @@ def send_daily_summary(state, equity_now, is_weekend=False, morning=False):
             tg("Lifetime (since deploy):" + parts[1])
 
 
+def process_halt(state, bars_dict):
+    """News/event kill switch. Reads state['_halt'] which the user (or scheduled
+    blackouts) can set to force-close all positions and block new entries.
+
+    state['_halt'] format:
+      {
+        'active': bool,                       # is halt active?
+        'reason': 'CPI release' / 'FOMC' etc.,
+        'since': ISO timestamp,
+        'symbols': [] or ['AAPL','NVDA',...]   # empty list = halt everything;
+                                               # populated = halt only these symbols
+                                               # (and BTC if 'BTC/USD' included)
+        'force_close': bool                   # close existing positions immediately?
+      }
+    Returns True if any halt is active and entries should be blocked tick-wide
+    (used by the entry loop to short-circuit)."""
+    halt = state.get('_halt') or {}
+    if not halt.get('active'):
+        return False
+    reason = halt.get('reason', 'manual halt')
+    since  = halt.get('since', '?')
+    sym_filter = halt.get('symbols') or []   # empty = all
+    force_close = bool(halt.get('force_close', True))
+    # One-shot Telegram alert when entering halt (dedupe via _halt['notified'])
+    if not halt.get('notified'):
+        scope = ', '.join(sym_filter) if sym_filter else 'ALL SYMBOLS'
+        tg(f"🔴🚨 TRADING HALT ACTIVATED\nReason: {reason}\nScope: {scope}\nForce close: {force_close}\nSince: {since}\n\nAll new entries BLOCKED. Existing positions {'being force-closed' if force_close else 'left open'}.")
+        halt['notified'] = True
+    if force_close:
+        # Force-close every state slot whose symbol matches the scope
+        for s in ALL_STRATS:
+            pos = state.get(s)
+            if not pos:
+                continue
+            sym = pos.get('symbol')
+            if sym_filter and sym not in sym_filter:
+                continue
+            bars = bars_dict.get(sym)
+            price = float(bars[-1]['c']) if bars else pos.get('entry', 0)
+            entry = pos.get('entry', price)
+            pl_pct = (price - entry) / entry * 100 if entry else 0
+            log(f'[{s}] HALT FORCE EXIT {sym}: {reason} | entry={entry:.4f} exit~{price:.4f} estP/L={pl_pct:+.2f}%')
+            same_sym_count = sum(1 for x, p in state.items() if isinstance(p, dict) and p.get('symbol') == sym)
+            if same_sym_count > 1 and pos.get('qty'):
+                # Re-use the safe partial-close logic from process_exit's improved path
+                positions = get_alpaca_positions()
+                if positions is None:
+                    log(f'[{s}] HALT close skipped {sym}: positions API down')
+                    continue
+                apos = positions.get(sym)
+                if not apos:
+                    log(f'[{s}] HALT cleared {sym}: no Alpaca position')
+                    state[s] = None
+                    continue
+                qty_avail = float(apos.get('qty_available', 0))
+                if qty_avail <= 1e-9:
+                    log(f'[{s}] HALT skipped {sym}: qty_available=0, retry next tick')
+                    continue
+                sell_qty = round(min(float(pos['qty']), qty_avail) * 0.999, 9)
+                if sell_qty < 1e-8:
+                    state[s] = None
+                    continue
+                result = close_position(sym, qty=sell_qty)
+            else:
+                result = close_position(sym)
+            if result is not None:
+                state[s] = None
+                tg(f"🔴 HALT SELL [{s}] {sym}\nReason: {reason}\nEntry: ${entry:.4f}\nExit: ${price:.4f}\nP/L: {pl_pct:+.2f}%")
+    return True   # halt active — caller should block new entries
+
+
+def set_halt(state, reason, symbols=None, force_close=True):
+    """Helper to activate the halt. Call from CLI script or manual edit."""
+    state['_halt'] = {
+        'active': True,
+        'reason': reason,
+        'since': datetime.now(timezone.utc).isoformat(),
+        'symbols': list(symbols) if symbols else [],
+        'force_close': bool(force_close),
+        'notified': False,
+    }
+    log(f'HALT ACTIVATED: reason={reason} symbols={symbols or "ALL"} force_close={force_close}')
+
+
+def clear_halt(state):
+    """Helper to release the halt. Logs and TGs the resume."""
+    halt = state.get('_halt') or {}
+    if halt.get('active'):
+        reason = halt.get('reason', '?')
+        tg(f"🟢 TRADING RESUMED\nPrevious halt: {reason}\nBot is back to normal operation.")
+    state['_halt'] = {'active': False}
+    log('HALT CLEARED — trading resumed')
+
+
 def maybe_send_morning_summary(state, utc_min, utc_hour, equity_now, is_weekend):
     """Send a morning recap at 07:00–07:04 UTC every day (weekday and weekend).
     Uses today's daily['trades'] which at 7 AM contains only overnight BTC activity
@@ -1557,13 +1651,20 @@ def run():
     for s in ALL_STRATS:
         process_exit(s, state, bars_dict, force_close_stocks)
 
+    # News/event halt — if active, force-close affected positions and short-circuit entries
+    halt_active = process_halt(state, bars_dict)
+
     # Recompute taken symbols
     taken_syms = {state[s]['symbol'] for s in ALL_STRATS if state.get(s)}
 
-    # Entries
+    # Entries (skipped entirely when a halt is active)
     # tick_ctx tracks cash committed in this tick so back-to-back buys don't over-spend
     # (Alpaca's account endpoint cash field lags behind rapid order submissions).
     tick_ctx = {'committed_cash': 0.0}
+    if halt_active:
+        log('Entries SKIPPED: trading halt active')
+        save_state(state)
+        return
     if in_last_entry_window:
         # All-in mode: try strategies in order until ONE fires, deploys all cash, and we stop.
         log(f'[ALL-IN WINDOW] 15:30-16:00 UTC: scanning for first signal to deploy all available cash')
