@@ -415,6 +415,14 @@ def buy_notional(symbol, notional, is_crypto):
         d = r.json()
         log(f"ORDER PLACED BUY {symbol} notional=${round(notional, 2)} id={d['id']} status={d['status']}")
         return d
+    except requests.HTTPError as e:
+        body_text = ''
+        try:
+            body_text = e.response.text[:300] if e.response is not None else ''
+        except Exception:
+            pass
+        log(f'ORDER FAILED BUY {symbol}: {e} body={body_text}')
+        return None
     except Exception as e:
         log(f'ORDER FAILED BUY {symbol}: {e}')
         return None
@@ -444,6 +452,30 @@ def close_position(symbol, qty=None):
             if r.status_code == 404:
                 log(f'CLOSE SKIPPED {symbol}: no position on Alpaca')
                 return None
+            # If Alpaca says insufficient qty available (some qty held for other pending
+            # orders), fall back to a partial close for just the available portion.
+            if r.status_code == 403:
+                try:
+                    err = r.json()
+                except Exception:
+                    err = {}
+                if err.get('code') == 40310000 and err.get('available'):
+                    avail = float(err['available'])
+                    if avail > 1e-9:
+                        log(f"FULL CLOSE blocked for {symbol} (qty held by pending orders); falling back to partial close avail={avail}")
+                        is_crypto = '/' in symbol
+                        body = {
+                            'symbol': symbol,
+                            'qty': str(round(avail * 0.999, 9)),
+                            'side': 'sell',
+                            'type': 'market',
+                            'time_in_force': 'gtc' if is_crypto else 'day',
+                        }
+                        r2 = requests.post(f'{TRADE_BASE}/orders', headers=HEADERS, json=body, timeout=15)
+                        r2.raise_for_status()
+                        d = r2.json()
+                        log(f"ORDER PLACED PARTIAL SELL (fallback) {symbol} qty={body['qty']} id={d.get('id')} status={d.get('status')}")
+                        return d
             r.raise_for_status()
             d = r.json()
             log(f"ORDER PLACED SELL ALL {symbol} qty={d.get('qty')} id={d.get('id')} status={d.get('status')}")
@@ -1166,7 +1198,7 @@ def process_exit(strat, state, bars_dict, force_close_stocks):
 
 def process_entry(strat, state, bars_dict, taken_syms, per_strategy_target,
                   block_new_stock_entries, market_open, all_in_mode=False,
-                  block_new_btc_entries=False):
+                  block_new_btc_entries=False, tick_ctx=None):
     """
     Returns True if an entry was placed for this strategy this tick, False otherwise.
     If all_in_mode is True, the entry uses ALL available cash (capped to ~95% of the
@@ -1229,6 +1261,11 @@ def process_entry(strat, state, bars_dict, taken_syms, per_strategy_target,
         # Falls back to cash if not present (some account types).
         nmbp = float(acct.get('non_marginable_buying_power', cash))
         available = min(cash, nmbp)
+        # Subtract cash already committed this tick by earlier strategies — Alpaca's
+        # account endpoint doesn't update fast enough between rapid back-to-back orders,
+        # so we maintain a local running total to prevent over-commitment 403s.
+        if tick_ctx is not None:
+            available -= tick_ctx.get('committed_cash', 0.0)
         if all_in_mode:
             # Last-entry window: deploy ALL available cash on the first signal that fires.
             # Floor at $50 to avoid placing dust orders if cash is essentially zero.
@@ -1278,6 +1315,10 @@ def process_entry(strat, state, bars_dict, taken_syms, per_strategy_target,
                 cooldown_min=60,
             )
         if order:
+            # Track committed cash so subsequent strategies in the same tick see reduced
+            # available cash and don't try to over-spend (Alpaca's account API lags).
+            if tick_ctx is not None:
+                tick_ctx['committed_cash'] = tick_ctx.get('committed_cash', 0.0) + notional
             state[strat] = {
                 'symbol': sym,
                 'entry': price,
@@ -1520,13 +1561,17 @@ def run():
     taken_syms = {state[s]['symbol'] for s in ALL_STRATS if state.get(s)}
 
     # Entries
+    # tick_ctx tracks cash committed in this tick so back-to-back buys don't over-spend
+    # (Alpaca's account endpoint cash field lags behind rapid order submissions).
+    tick_ctx = {'committed_cash': 0.0}
     if in_last_entry_window:
         # All-in mode: try strategies in order until ONE fires, deploys all cash, and we stop.
         log(f'[ALL-IN WINDOW] 15:30-16:00 UTC: scanning for first signal to deploy all available cash')
         for s in ALL_STRATS:
             placed = process_entry(s, state, bars_dict, taken_syms, per_strategy_target,
                                    block_new_stock_entries, market_open, all_in_mode=True,
-                                   block_new_btc_entries=block_new_btc_entries)
+                                   block_new_btc_entries=block_new_btc_entries,
+                                   tick_ctx=tick_ctx)
             if placed:
                 log(f'[ALL-IN WINDOW] [{s}] consumed available cash; halting further entries this tick')
                 break
@@ -1534,7 +1579,8 @@ def run():
         for s in ALL_STRATS:
             process_entry(s, state, bars_dict, taken_syms, per_strategy_target,
                           block_new_stock_entries, market_open,
-                          block_new_btc_entries=block_new_btc_entries)
+                          block_new_btc_entries=block_new_btc_entries,
+                          tick_ctx=tick_ctx)
 
     # Morning summary: 07:00 UTC every day (overnight recap, focuses on BTC since stocks closed)
     maybe_send_morning_summary(state, utc_min, now_utc.hour, equity, is_weekend)
