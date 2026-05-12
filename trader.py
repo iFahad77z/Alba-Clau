@@ -1144,9 +1144,13 @@ def process_exit(strat, state, bars_dict, force_close_stocks, force_close_stocks
         return
     sym = pos['symbol']
     is_crypto = sym == 'BTC/USD'
-    # For long-tf (15-min) strategies, the force-close window is 23:30-24:00 UTC
-    # not 19:30-20:00 UTC. Pick the right flag based on the strategy.
-    fc = force_close_stocks_long_tf if strat in LONG_TF_STRATS else force_close_stocks
+    # 15-min strategies do NOT have any time-based force-close — positions run until
+    # their natural signal exit or ATR/swing-low stop fires, even if market closes.
+    # Only the original 5-min series honors the 19:30 UTC force-close window.
+    if strat in LONG_TF_STRATS:
+        fc = False
+    else:
+        fc = force_close_stocks
     bars = bars_for(bars_dict, sym, strat)
     if not bars:
         return
@@ -1730,9 +1734,12 @@ def run():
     block_new_stock_entries_long_tf = (not long_tf_market_open) or utc_min >= long_tf_force_close_min
     btc_active_window_long_tf = is_weekend or utc_min >= long_tf_force_close_min or utc_min < long_tf_pre_market_min
     block_new_btc_entries_long_tf = not btc_active_window_long_tf
-    force_close_stocks_long_tf = (not is_weekend) and long_tf_force_close_min <= utc_min < long_tf_after_market_end_min
+    # NOTE: 15-min strategies have NO force-close. Positions run until signal/stop fires.
+    # We still gate new ENTRIES at long_tf_force_close_min (23:30 UTC) so the bot doesn't
+    # open fresh stock positions in the last 30 min before after-market close.
+    force_close_stocks_long_tf = False
 
-    log(f'Time: UTC={now_utc:%H:%M} marketOpen={market_open} blockStockEntries={block_new_stock_entries} blockBtcEntries={block_new_btc_entries} forceCloseStocks={force_close_stocks} lastEntryWindow={in_last_entry_window} | 15m: stockOpen={long_tf_market_open} blockStock={block_new_stock_entries_long_tf} blockBtc={block_new_btc_entries_long_tf} fc={force_close_stocks_long_tf}')
+    log(f'Time: UTC={now_utc:%H:%M} marketOpen={market_open} blockStockEntries={block_new_stock_entries} blockBtcEntries={block_new_btc_entries} forceCloseStocks={force_close_stocks} lastEntryWindow={in_last_entry_window} | 15m: stockOpen={long_tf_market_open} blockStock={block_new_stock_entries_long_tf} blockBtc={block_new_btc_entries_long_tf} (no force-close)')
 
     state = load_state()
     sync_state_with_alpaca(state)
