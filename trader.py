@@ -36,8 +36,14 @@ HEADERS = {'APCA-API-KEY-ID': KEY, 'APCA-API-SECRET-KEY': SECRET}
 STATE_PATH = Path('scalper_state.json')
 
 ATR_PERIOD = 14
-ATR_MULT = 1.5
+ATR_MULT = 1.5             # default stop multiplier for stocks
+ATR_MULT_BTC = 2.5         # wider stop for BTC due to higher 5-min volatility
 CASH_PCT = 0.99
+# Base strategies that DO NOT trade BTC (and their variants inherit this restriction):
+#   - 'D' (MACD): bleeds on BTC's micro-volatility
+#   - 'X-A' (Volume EMA): Alpaca crypto volume data is unreliable → noise signals
+# Family is checked via base_strat() so D2/D3/D4/X-A2/X-A3/X-A4 are all blocked on BTC.
+NO_BTC_STRATS = {'D', 'X-A'}
 VOL_MULT_THRESHOLD = 1.0  # default for strategies that don't override
 VOL_MULT_PER_STRAT = {
     'A': 1.0,
@@ -101,6 +107,18 @@ SWINGLOW_VARIANTS = {
 SWINGLOW_STOP_STRATS = set(SWINGLOW_VARIANTS.keys())
 SWINGLOW_LOOKBACK = 20  # bars (100 min on 5-min chart)
 
+# Long-timeframe variants ("copy 5"): same entry/exit signal as base, but run on
+# 15-min bars instead of 5-min, and trade extended hours (pre + after market).
+# Force-close at 23:30 UTC (30 min before after-market end), then BTC-only until
+# next pre-market start at 08:00 UTC.
+LONG_TF_VARIANTS = {
+    'A5': 'A', 'B5': 'B', 'C5': 'C', 'D5': 'D', 'E5': 'E', 'F5': 'F', 'G5': 'G',
+    'H5': 'H', 'I5': 'I', 'J5': 'J', 'K5': 'K', 'L5': 'L', 'M5': 'M', 'N5': 'N',
+    'X-A5': 'X-A',
+    'X-K5': 'X-K',
+}
+LONG_TF_STRATS = set(LONG_TF_VARIANTS.keys())
+
 ALL_STRATS = (
     'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N',
     'A2', 'B2', 'C2', 'D2', 'E2', 'G2', 'H2', 'I2', 'J2', 'K2', 'L2', 'M2',
@@ -109,6 +127,8 @@ ALL_STRATS = (
     'X-K', 'X-K2', 'X-K3',
     'A4', 'B4', 'C4', 'D4', 'E4', 'F4', 'G4', 'H4', 'I4', 'J4', 'K4', 'L4', 'M4', 'N4',
     'X-A4', 'X-K4',
+    'A5', 'B5', 'C5', 'D5', 'E5', 'F5', 'G5', 'H5', 'I5', 'J5', 'K5', 'L5', 'M5', 'N5',
+    'X-A5', 'X-K5',
 )
 
 STRAT_NAMES = {
@@ -174,18 +194,50 @@ STRAT_NAMES = {
     'N4':   'RSI Bounce + 200 EMA Filter + Swing-Low Stop',
     'X-A4': 'Volume-EMA Cross + 200 EMA Filter + Swing-Low Stop',
     'X-K4': 'BB+RSI Reversal + 200 EMA Filter + Swing-Low Stop',
+    'A5':   'Fast EMA Cross (9/21) [15-min, ext hours]',
+    'B5':   'Medium EMA Cross (20/50) [15-min, ext hours]',
+    'C5':   'Donchian Breakout (20/10) [15-min, ext hours]',
+    'D5':   'MACD [15-min, ext hours]',
+    'E5':   'Bollinger Reversion [15-min, ext hours]',
+    'F5':   'RSI Bounce [15-min, ext hours]',
+    'G5':   'SuperTrend [15-min, ext hours]',
+    'H5':   'Opening Range Breakout [15-min, ext hours]',
+    'I5':   'VWAP Reclaim [15-min, ext hours]',
+    'J5':   'Inside Bar Breakout [15-min, ext hours]',
+    'K5':   'Slow EMA (50/200) [15-min, ext hours]',
+    'L5':   'Slow EMA + TP [15-min, ext hours]',
+    'M5':   'Slow EMA No-Stop [15-min, ext hours]',
+    'N5':   'RSI Bounce + 200 EMA [15-min, ext hours]',
+    'X-A5': 'Volume-EMA Cross [15-min, ext hours]',
+    'X-K5': 'BB+RSI Reversal [15-min, ext hours]',
 }
 
 
 def base_strat(strat):
-    """Map a variant ('A2', 'A3', 'A4') to its base strategy ('A'). Identity for non-variants."""
+    """Map a variant (A2/A3/A4/A5) to its base strategy ('A'). Identity for non-variants."""
     if strat in FILTER_VARIANTS:
         return FILTER_VARIANTS[strat]
     if strat in TRAIL_VARIANTS:
         return TRAIL_VARIANTS[strat]
     if strat in SWINGLOW_VARIANTS:
         return SWINGLOW_VARIANTS[strat]
+    if strat in LONG_TF_VARIANTS:
+        return LONG_TF_VARIANTS[strat]
     return strat
+
+
+def strategy_timeframe(strat):
+    """Return '5Min' or '15Min' depending on whether this strategy is a long-tf variant."""
+    return '15Min' if strat in LONG_TF_STRATS else '5Min'
+
+
+def bars_for(bars_dict, sym, strat):
+    """Returns the right bar series for a strategy's timeframe, or None if unavailable.
+    bars_dict structure: { sym: { '5Min': [...], '15Min': [...] } }"""
+    per_sym = bars_dict.get(sym)
+    if not per_sym:
+        return None
+    return per_sym.get(strategy_timeframe(strat))
 
 # Take-profit thresholds (% gain that triggers exit)
 TAKE_PROFIT_PER_STRAT = {
@@ -245,29 +297,25 @@ def tg_error_once(state, key, msg, cooldown_min=60):
     tg(msg)
 
 
-def get_bars(symbol, is_crypto):
-    """Fetch the most recent ~500 5-min bars for a symbol.
-
-    NOTE on the previous (broken) behavior:
-        With sort=asc, limit=1000, start=10d-ago, Alpaca returns the FIRST 1000
-        bars in the window. For BTC (288 bars/day), 1000 bars = 3.5 days, so the
-        bot was reading data from 6-10 days ago and missing the last week. Stocks
-        weren't affected (market hours -> only ~390 bars/10d, fits in 1000).
-        Now we use sort=desc (newest first) and reverse to ascending — guarantees
-        the last bar is the current 5-min slot.
-    """
-    # Different lookback per asset class:
-    # - Crypto: 4 days back at 288 bars/day = ~1152 bars total, fetch newest 500 (~42h).
-    # - Stocks: market is only open 6.5h/day, and the IEX free feed is sparse (~160 bars
-    #   in 4 trading days). Need 10 calendar days to comfortably get >250 bars for 200 EMA.
-    if is_crypto:
-        start = (datetime.now(timezone.utc) - timedelta(days=4)).strftime('%Y-%m-%dT%H:%M:%SZ')
-        url = DATA_CRYPTO
-        params = {'symbols': symbol, 'timeframe': '5Min', 'limit': 500, 'sort': 'desc', 'start': start}
+def get_bars(symbol, is_crypto, timeframe='5Min'):
+    """Fetch recent bars for a symbol. timeframe is '5Min' or '15Min'.
+    Uses sort=desc + limit + reverse to ascending so [-1] is the current bar."""
+    # Lookback depends on timeframe AND asset class:
+    # - 5Min crypto:  4 days  (~1152 bars total, fetch newest 500)
+    # - 5Min stocks: 10 days  (IEX sparse, ~50/day → ~500 bars)
+    # - 15Min crypto: 8 days  (~768 bars, fetch newest 500)
+    # - 15Min stocks: 20 days (15-min IEX bars are even sparser, plus ext-hours bars)
+    if timeframe == '15Min':
+        days_back = 8 if is_crypto else 20
     else:
-        start = (datetime.now(timezone.utc) - timedelta(days=10)).strftime('%Y-%m-%dT%H:%M:%SZ')
+        days_back = 4 if is_crypto else 10
+    start = (datetime.now(timezone.utc) - timedelta(days=days_back)).strftime('%Y-%m-%dT%H:%M:%SZ')
+    if is_crypto:
+        url = DATA_CRYPTO
+        params = {'symbols': symbol, 'timeframe': timeframe, 'limit': 1000, 'sort': 'desc', 'start': start}
+    else:
         url = DATA_STOCKS
-        params = {'symbols': symbol, 'timeframe': '5Min', 'limit': 1000, 'sort': 'desc', 'start': start, 'feed': 'iex'}
+        params = {'symbols': symbol, 'timeframe': timeframe, 'limit': 1000, 'sort': 'desc', 'start': start, 'feed': 'iex'}
     try:
         r = requests.get(url, headers=HEADERS, params=params, timeout=20)
         r.raise_for_status()
@@ -368,7 +416,9 @@ def claim_orphan_positions(state, bars_dict, alpaca_positions):
         if not flat_slots:
             log(f'ORPHAN UNCLAIMED {sym}: no flat strategy slots available')
             continue
-        bars = bars_dict.get(sym)
+        # Use 5-min bars by default for orphan claim (most common timeframe).
+        per_sym = bars_dict.get(sym, {})
+        bars = per_sym.get('5Min') or per_sym.get('15Min')
         if not bars:
             log(f'ORPHAN UNCLAIMED {sym}: no bars data, cannot compute stop')
             continue
@@ -401,14 +451,33 @@ def claim_orphan_positions(state, bars_dict, alpaca_positions):
         tg(f"CLAIMED ORPHAN {sym}\nStrategy [{slot}]: {STRAT_NAMES[slot]}\nEntry (actual): ${actual_entry:.4f}\nCurrent: ${current_price:.4f}\nFresh stop: ${stop_price:.4f}\nNotional: ${market_value:.2f}")
 
 
-def buy_notional(symbol, notional, is_crypto):
-    body = {
-        'symbol': symbol,
-        'notional': round(notional, 2),
-        'side': 'buy',
-        'type': 'market',
-        'time_in_force': 'gtc' if is_crypto else 'day',
-    }
+def buy_notional(symbol, notional, is_crypto, extended_hours=False, ref_price=None):
+    """Place a buy order. For stocks during extended hours, uses a LIMIT order (Alpaca
+    requirement) with a 0.5% slippage cap and qty derived from notional/ref_price.
+    Crypto and regular-hours stocks use notional market orders as before."""
+    if extended_hours and not is_crypto and ref_price and ref_price > 0:
+        limit_price = round(ref_price * 1.005, 2)  # 0.5% above as a slippage cap
+        qty = round(notional / ref_price, 4) if ref_price else 0
+        if qty <= 0:
+            log(f'ORDER FAILED BUY {symbol}: ext-hours qty=0 (notional={notional} ref={ref_price})')
+            return None
+        body = {
+            'symbol': symbol,
+            'qty': str(qty),
+            'side': 'buy',
+            'type': 'limit',
+            'limit_price': str(limit_price),
+            'time_in_force': 'day',
+            'extended_hours': True,
+        }
+    else:
+        body = {
+            'symbol': symbol,
+            'notional': round(notional, 2),
+            'side': 'buy',
+            'type': 'market',
+            'time_in_force': 'gtc' if is_crypto else 'day',
+        }
     try:
         r = requests.post(f'{TRADE_BASE}/orders', headers=HEADERS, json=body, timeout=15)
         r.raise_for_status()
@@ -889,6 +958,9 @@ def get_entry_signal(strat, bars, sym, is_crypto):
     if strat in TRAIL_VARIANTS:
         # Trailing-stop twin: same entry as base. Stop ratchet is applied in process_exit.
         return _get_entry_signal_base(TRAIL_VARIANTS[strat], bars, sym, is_crypto)
+    if strat in LONG_TF_VARIANTS:
+        # 15-min twin: same entry as base — only the bars timeframe differs.
+        return _get_entry_signal_base(LONG_TF_VARIANTS[strat], bars, sym, is_crypto)
     return _get_entry_signal_base(strat, bars, sym, is_crypto)
 
 
@@ -980,6 +1052,8 @@ def get_exit_signal(strat, bars, pos):
         return _get_exit_signal_base(TRAIL_VARIANTS[strat], bars, pos)
     if strat in SWINGLOW_VARIANTS:
         return _get_exit_signal_base(SWINGLOW_VARIANTS[strat], bars, pos)
+    if strat in LONG_TF_VARIANTS:
+        return _get_exit_signal_base(LONG_TF_VARIANTS[strat], bars, pos)
     return _get_exit_signal_base(strat, bars, pos)
 
 
@@ -1064,13 +1138,16 @@ def _get_exit_signal_base(strat, bars, pos):
     return False, ''
 
 
-def process_exit(strat, state, bars_dict, force_close_stocks):
+def process_exit(strat, state, bars_dict, force_close_stocks, force_close_stocks_long_tf=False):
     pos = state.get(strat)
     if not pos:
         return
     sym = pos['symbol']
     is_crypto = sym == 'BTC/USD'
-    bars = bars_dict.get(sym)
+    # For long-tf (15-min) strategies, the force-close window is 23:30-24:00 UTC
+    # not 19:30-20:00 UTC. Pick the right flag based on the strategy.
+    fc = force_close_stocks_long_tf if strat in LONG_TF_STRATS else force_close_stocks
+    bars = bars_for(bars_dict, sym, strat)
     if not bars:
         return
     closes = [float(b['c']) for b in bars]
@@ -1100,9 +1177,10 @@ def process_exit(strat, state, bars_dict, force_close_stocks):
     should_exit, reason = False, ''
     skip_force_close = bs in NO_FORCE_CLOSE_STRATS
     skip_atr_stop = bs in NO_ATR_STOP_STRATS
-    # Force-close applies to STOCKS ONLY at 19:30 UTC weekdays. BTC trades 24/7.
-    if (not is_crypto) and force_close_stocks and not skip_force_close:
-        should_exit, reason = True, 'FORCE CLOSE (19:30 UTC, 30 min before market close)'
+    # Force-close applies to STOCKS ONLY. 5-min strats: 19:30 UTC. 15-min strats: 23:30 UTC.
+    if (not is_crypto) and fc and not skip_force_close:
+        when = '23:30 UTC (15-min series)' if strat in LONG_TF_STRATS else '19:30 UTC (5-min series)'
+        should_exit, reason = True, f'FORCE CLOSE ({when})'
     elif price <= stop and not skip_atr_stop:
         should_exit, reason = True, f'STOP HIT (price={price:.4f} <= stop={stop:.4f})'
     else:
@@ -1198,13 +1276,19 @@ def process_exit(strat, state, bars_dict, force_close_stocks):
 
 def process_entry(strat, state, bars_dict, taken_syms, per_strategy_target,
                   block_new_stock_entries, market_open, all_in_mode=False,
-                  block_new_btc_entries=False, tick_ctx=None):
+                  block_new_btc_entries=False, tick_ctx=None,
+                  block_new_stock_entries_long_tf=False,
+                  block_new_btc_entries_long_tf=False):
     """
     Returns True if an entry was placed for this strategy this tick, False otherwise.
     If all_in_mode is True, the entry uses ALL available cash (capped to ~95% of the
     free buying power to allow for slippage), instead of per_strategy_target. The caller
     is responsible for stopping the loop after the first all-in entry fires.
     """
+    # For long-tf (15-min) strategies, override the time-gate flags with the long-tf versions.
+    if strat in LONG_TF_STRATS:
+        block_new_stock_entries = block_new_stock_entries_long_tf
+        block_new_btc_entries = block_new_btc_entries_long_tf
     if state.get(strat):
         return False  # already holding
 
@@ -1227,7 +1311,9 @@ def process_entry(strat, state, bars_dict, taken_syms, per_strategy_target,
             continue
         if is_crypto and base_strat(strat) in STOCK_ONLY_STRATS:
             continue  # ORB and VWAP don't apply to crypto
-        bars = bars_dict.get(sym)
+        if is_crypto and base_strat(strat) in NO_BTC_STRATS:
+            continue  # MACD + Volume-EMA strategies have been blacklisted from BTC (poor fit)
+        bars = bars_for(bars_dict, sym, strat)
         if not bars:
             continue
 
@@ -1284,6 +1370,8 @@ def process_entry(strat, state, bars_dict, taken_syms, per_strategy_target,
         # Stop calculation: X4 variants use the lowest low of the past SWINGLOW_LOOKBACK
         # bars (chart structure stop). All others use 1.5×ATR (X3 also starts here and
         # ratchets up in process_exit).
+        # BTC uses a wider ATR multiplier (2.5x vs 1.5x) due to higher 5-min volatility.
+        atr_mult_here = ATR_MULT_BTC if is_crypto else ATR_MULT
         if strat in SWINGLOW_STOP_STRATS:
             recent_lows = [float(b['l']) for b in bars[-SWINGLOW_LOOKBACK:]]
             swing_low = min(recent_lows) if recent_lows else price
@@ -1294,18 +1382,24 @@ def process_entry(strat, state, bars_dict, taken_syms, per_strategy_target,
                 stop_price = swing_low
                 stop_kind = f"swing-low({SWINGLOW_LOOKBACK}b)"
             else:
-                stop_price = price - ATR_MULT * a14
+                stop_price = price - atr_mult_here * a14
                 stop_kind = f"ATR fallback (swing-low {swing_low:.4f} >= price)"
         else:
-            stop_price = price - ATR_MULT * a14
-            stop_kind = f"ATR(14)×{ATR_MULT}"
+            stop_price = price - atr_mult_here * a14
+            stop_kind = f"ATR(14)×{atr_mult_here}"
         log(f'[{strat}] ENTRY SIGNAL {sym} @ {price:.4f} | {details} | {stop_kind} stop={stop_price:.4f} notional=${notional:.2f}')
         # Compute the planned qty up front so partial-close (used when multiple strategies
         # share a symbol) has a valid number to send. Notional-based crypto buys come back
         # from Alpaca with qty=null and filled_qty=0 at placement time, so we couldn't rely
         # on the order response alone.
         planned_qty = round(notional / price, 9) if price > 0 else 0
-        order = buy_notional(sym, notional, is_crypto)
+        # For 15-min stock strategies outside regular hours (13:30-20:00 UTC), use a
+        # limit order with extended_hours=True so Alpaca accepts it in pre/post market.
+        utc_min_now = datetime.now(timezone.utc).hour * 60 + datetime.now(timezone.utc).minute
+        regular_hours = 13*60+30 <= utc_min_now < 20*60
+        use_ext_hours = (strat in LONG_TF_STRATS) and (not is_crypto) and (not regular_hours)
+        order = buy_notional(sym, notional, is_crypto,
+                             extended_hours=use_ext_hours, ref_price=price)
         if not order:
             tg_error_once(
                 state,
@@ -1459,6 +1553,17 @@ def process_halt(state, bars_dict):
     halt = state.get('_halt') or {}
     if not halt.get('active'):
         return False
+    # Auto-resume: if 'auto_resume_at' (ISO timestamp) has passed, clear the halt.
+    auto_resume_at = halt.get('auto_resume_at')
+    if auto_resume_at:
+        try:
+            resume_dt = datetime.fromisoformat(auto_resume_at.replace('Z', '+00:00'))
+            if datetime.now(timezone.utc) >= resume_dt:
+                log(f'AUTO-RESUMING halt: {halt.get("reason","?")} (scheduled for {auto_resume_at})')
+                clear_halt(state)
+                return False
+        except Exception as e:
+            log(f'Failed to parse auto_resume_at={auto_resume_at}: {e}')
     reason = halt.get('reason', 'manual halt')
     since  = halt.get('since', '?')
     sym_filter = halt.get('symbols') or []   # empty = all
@@ -1477,7 +1582,7 @@ def process_halt(state, bars_dict):
             sym = pos.get('symbol')
             if sym_filter and sym not in sym_filter:
                 continue
-            bars = bars_dict.get(sym)
+            bars = bars_for(bars_dict, sym, s)
             price = float(bars[-1]['c']) if bars else pos.get('entry', 0)
             entry = pos.get('entry', price)
             pl_pct = (price - entry) / entry * 100 if entry else 0
@@ -1607,13 +1712,27 @@ def run():
     # (only the all-in entry path can fire during the window). After 16:00 UTC, stock entries
     # remain blocked all the way until the next 13:30 UTC.
     block_new_stock_entries = (not market_open) or utc_min >= last_entry_window_start
-    # BTC time-of-day rule: blocked during stock-trading hours (13:30–19:30 UTC weekdays).
-    # Allowed from 19:30 UTC (force-close start) through the next 13:30 UTC, plus weekends.
+    # BTC time-of-day rule (5-min series): blocked during stock-trading hours (13:30–19:30
+    # UTC weekdays). Allowed from 19:30 UTC (force-close) through next 13:30 UTC, plus weekends.
     btc_active_window = is_weekend or utc_min >= force_close_at_min or utc_min < market_open_min
     block_new_btc_entries = not btc_active_window
-    # Force-close fires from 19:30 UTC for 30 min — covers 19:30–20:00 UTC, all in regular hours.
+    # Force-close (5-min series) fires 19:30–20:00 UTC weekdays.
     force_close_stocks = (not is_weekend) and force_close_at_min <= utc_min < (force_close_at_min + 30)
-    log(f'Time: UTC={now_utc:%H:%M} marketOpen={market_open} blockStockEntries={block_new_stock_entries} blockBtcEntries={block_new_btc_entries} forceCloseStocks={force_close_stocks} lastEntryWindow={in_last_entry_window}')
+
+    # === 15-min ("5"-suffix) strategy series timing ===
+    # Stock-active window: pre-market open (08:00 UTC) → 30 min before after-market close (23:30 UTC).
+    # Force-close: 23:30–24:00 UTC weekday.
+    # BTC-active window: 00:00–08:00 UTC weekday + all weekend (everything outside stock window).
+    long_tf_pre_market_min  = 8 * 60         # 08:00 UTC (pre-market open in EDT)
+    long_tf_force_close_min = 23 * 60 + 30   # 23:30 UTC (30 min before after-market close)
+    long_tf_after_market_end_min = 24 * 60   # 24:00 UTC (after-market close in EDT)
+    long_tf_market_open = (not is_weekend) and long_tf_pre_market_min <= utc_min < long_tf_after_market_end_min
+    block_new_stock_entries_long_tf = (not long_tf_market_open) or utc_min >= long_tf_force_close_min
+    btc_active_window_long_tf = is_weekend or utc_min >= long_tf_force_close_min or utc_min < long_tf_pre_market_min
+    block_new_btc_entries_long_tf = not btc_active_window_long_tf
+    force_close_stocks_long_tf = (not is_weekend) and long_tf_force_close_min <= utc_min < long_tf_after_market_end_min
+
+    log(f'Time: UTC={now_utc:%H:%M} marketOpen={market_open} blockStockEntries={block_new_stock_entries} blockBtcEntries={block_new_btc_entries} forceCloseStocks={force_close_stocks} lastEntryWindow={in_last_entry_window} | 15m: stockOpen={long_tf_market_open} blockStock={block_new_stock_entries_long_tf} blockBtc={block_new_btc_entries_long_tf} fc={force_close_stocks_long_tf}')
 
     state = load_state()
     sync_state_with_alpaca(state)
@@ -1630,15 +1749,25 @@ def run():
     summary = ' | '.join(f"{s}={state[s] and state[s]['symbol'] or 'flat'}" for s in ALL_STRATS)
     log(f'State: {summary}')
 
+    # bars_dict structure: { sym: { '5Min': [...], '15Min': [...] } }
+    # 15Min bars are only fetched/used if there are LONG_TF strategies in ALL_STRATS.
     bars_dict = {}
+    have_long_tf = bool(LONG_TF_STRATS)
     for sym, is_crypto in WATCHLIST:
-        bars = get_bars(sym, is_crypto)
-        # Need enough history for 200-EMA based filters/strategies. 220 gives
-        # 200 EMA convergence + room for cross detection on the trigger bar.
-        if bars and len(bars) >= 220:
-            bars_dict[sym] = bars
-        elif bars:
-            log(f'SKIP {sym}: only {len(bars)} bars available (need >=220)')
+        per_sym = {}
+        b5 = get_bars(sym, is_crypto, '5Min')
+        if b5 and len(b5) >= 220:
+            per_sym['5Min'] = b5
+        elif b5:
+            log(f'SKIP {sym} 5Min: only {len(b5)} bars (need >=220)')
+        if have_long_tf:
+            b15 = get_bars(sym, is_crypto, '15Min')
+            if b15 and len(b15) >= 220:
+                per_sym['15Min'] = b15
+            elif b15:
+                log(f'SKIP {sym} 15Min: only {len(b15)} bars (need >=220)')
+        if per_sym:
+            bars_dict[sym] = per_sym
 
     # Claim any orphan Alpaca positions (existing positions that no strategy is tracking)
     alpaca_positions_now = get_alpaca_positions()
@@ -1649,7 +1778,8 @@ def run():
 
     # Exits first
     for s in ALL_STRATS:
-        process_exit(s, state, bars_dict, force_close_stocks)
+        process_exit(s, state, bars_dict, force_close_stocks,
+                     force_close_stocks_long_tf=force_close_stocks_long_tf)
 
     # News/event halt — if active, force-close affected positions and short-circuit entries
     halt_active = process_halt(state, bars_dict)
@@ -1672,7 +1802,9 @@ def run():
             placed = process_entry(s, state, bars_dict, taken_syms, per_strategy_target,
                                    block_new_stock_entries, market_open, all_in_mode=True,
                                    block_new_btc_entries=block_new_btc_entries,
-                                   tick_ctx=tick_ctx)
+                                   tick_ctx=tick_ctx,
+                                   block_new_stock_entries_long_tf=block_new_stock_entries_long_tf,
+                                   block_new_btc_entries_long_tf=block_new_btc_entries_long_tf)
             if placed:
                 log(f'[ALL-IN WINDOW] [{s}] consumed available cash; halting further entries this tick')
                 break
@@ -1681,7 +1813,9 @@ def run():
             process_entry(s, state, bars_dict, taken_syms, per_strategy_target,
                           block_new_stock_entries, market_open,
                           block_new_btc_entries=block_new_btc_entries,
-                          tick_ctx=tick_ctx)
+                          tick_ctx=tick_ctx,
+                          block_new_stock_entries_long_tf=block_new_stock_entries_long_tf,
+                          block_new_btc_entries_long_tf=block_new_btc_entries_long_tf)
 
     # Morning summary: 07:00 UTC every day (overnight recap, focuses on BTC since stocks closed)
     maybe_send_morning_summary(state, utc_min, now_utc.hour, equity, is_weekend)
