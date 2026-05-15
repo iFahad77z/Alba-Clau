@@ -1347,10 +1347,18 @@ def process_entry(strat, state, bars_dict, taken_syms, per_strategy_target,
         if not acct:
             continue
         cash = float(acct['cash'])
-        # Use non_marginable_buying_power to prevent the bot from using margin.
-        # Falls back to cash if not present (some account types).
+        # Two buying-power pools to respect:
+        #   non_marginable_buying_power: governs BTC (non-marginable asset)
+        #   daytrading_buying_power: governs same-day stock buys (depletes fast with many
+        #                            concurrent strategies). Alpaca rejects with 403
+        #                            ('insufficient day trading buying power') if exceeded.
         nmbp = float(acct.get('non_marginable_buying_power', cash))
-        available = min(cash, nmbp)
+        dtbp = float(acct.get('daytrading_buying_power', 0))
+        if is_crypto:
+            available = min(cash, nmbp)
+        else:
+            # For stocks, daytrading_buying_power is the binding constraint.
+            available = min(cash, nmbp, dtbp) if dtbp > 0 else min(cash, nmbp)
         # Subtract cash already committed this tick by earlier strategies — Alpaca's
         # account endpoint doesn't update fast enough between rapid back-to-back orders,
         # so we maintain a local running total to prevent over-commitment 403s.
@@ -1364,12 +1372,22 @@ def process_entry(strat, state, bars_dict, taken_syms, per_strategy_target,
                 continue
             notional = available * CASH_PCT
         else:
-            # All-or-nothing sizing: only enter if at least 95% of the full per-strategy target
-            # is available. Prevents tiny noise trades from rationing capital across strategies.
-            if available < per_strategy_target * 0.95:
-                log(f'[{strat}] BUY SKIPPED {sym}: cash ${available:.2f} below 95% of target ${per_strategy_target:.2f}')
+            # Sizing logic:
+            #   1. If we have ≥95% of the per-strategy target available, use the target.
+            #   2. Else if we have at least 50% of target, scale DOWN to fit available
+            #      (better to place a smaller order than fail). Helps when daytrading
+            #      buying power is partially depleted.
+            #   3. Else skip entirely.
+            min_acceptable = per_strategy_target * 0.50
+            if available < min_acceptable:
+                log(f'[{strat}] BUY SKIPPED {sym}: avail ${available:.2f} below 50% of target ${per_strategy_target:.2f} (likely dtbp depleted)')
                 continue
-            notional = per_strategy_target * CASH_PCT
+            elif available < per_strategy_target * 0.95:
+                # Scale down to available, with 1% headroom
+                notional = available * 0.99
+                log(f'[{strat}] BUY SCALED DOWN {sym}: avail ${available:.2f} < target, sizing to ${notional:.2f}')
+            else:
+                notional = per_strategy_target * CASH_PCT
 
         # Stop calculation: X4 variants use the lowest low of the past SWINGLOW_LOOKBACK
         # bars (chart structure stop). All others use 1.5×ATR (X3 also starts here and
