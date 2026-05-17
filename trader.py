@@ -43,7 +43,20 @@ CASH_PCT = 0.99
 #   - 'D' (MACD): bleeds on BTC's micro-volatility
 #   - 'X-A' (Volume EMA): Alpaca crypto volume data is unreliable → noise signals
 # Family is checked via base_strat() so D2/D3/D4/X-A2/X-A3/X-A4 are all blocked on BTC.
-NO_BTC_STRATS = {'D', 'X-A'}
+# Existing strategies no longer trade BTC at all — BTC trading is now exclusively
+# handled by 'BTC-W' (weekend-only 1h-bar Donchian strategy). The old strategies
+# were designed for stocks and lost consistently on crypto (~20% WR, −$150).
+# To re-enable BTC on a specific strategy, remove it from this set.
+NO_BTC_STRATS = {
+    'A','B','C','D','E','F','G','J','K','L','M','N','X-A','X-K',
+    # Variants inherit via base_strat() in process_entry, so listing bases is enough.
+}
+# Strategies that ONLY trade BTC (skip every stock in WATCHLIST).
+BTC_ONLY_STRATS = {'BTC-W'}
+# Strategies that only fire on weekends (Sat/Sun UTC).
+WEEKEND_ONLY_STRATS = {'BTC-W'}
+# Strategies that use 1h bars instead of 5Min/15Min.
+HOUR_TF_STRATS = {'BTC-W'}
 VOL_MULT_THRESHOLD = 1.0  # default for strategies that don't override
 VOL_MULT_PER_STRAT = {
     'A': 1.0,
@@ -129,6 +142,7 @@ ALL_STRATS = (
     'X-A4', 'X-K4',
     'A5', 'B5', 'C5', 'D5', 'E5', 'F5', 'G5', 'H5', 'I5', 'J5', 'K5', 'L5', 'M5', 'N5',
     'X-A5', 'X-K5',
+    'BTC-W',
 )
 
 STRAT_NAMES = {
@@ -210,6 +224,7 @@ STRAT_NAMES = {
     'N5':   'RSI Bounce + 200 EMA [15-min, ext hours]',
     'X-A5': 'Volume-EMA Cross [15-min, ext hours]',
     'X-K5': 'BB+RSI Reversal [15-min, ext hours]',
+    'BTC-W': 'BTC Weekend Donchian (1h bars, Sat 00:00 → Sun 22:00 UTC, BTC-only)',
 }
 
 
@@ -227,8 +242,12 @@ def base_strat(strat):
 
 
 def strategy_timeframe(strat):
-    """Return '5Min' or '15Min' depending on whether this strategy is a long-tf variant."""
-    return '15Min' if strat in LONG_TF_STRATS else '5Min'
+    """Return the bar timeframe a strategy uses: '5Min' (default), '15Min', or '1Hour'."""
+    if strat in HOUR_TF_STRATS:
+        return '1Hour'
+    if strat in LONG_TF_STRATS:
+        return '15Min'
+    return '5Min'
 
 
 def bars_for(bars_dict, sym, strat):
@@ -305,7 +324,11 @@ def get_bars(symbol, is_crypto, timeframe='5Min'):
     # - 5Min stocks: 10 days  (IEX sparse, ~50/day → ~500 bars)
     # - 15Min crypto: 8 days  (~768 bars, fetch newest 500)
     # - 15Min stocks: 20 days (15-min IEX bars are even sparser, plus ext-hours bars)
-    if timeframe == '15Min':
+    if timeframe == '1Hour':
+        # 1h bars: need long lookback for 50-EMA + 20-bar Donchian + ATR.
+        # Crypto 24/7 → 24 bars/day. 30 days = 720 bars, plenty of headroom.
+        days_back = 30
+    elif timeframe == '15Min':
         days_back = 8 if is_crypto else 20
     else:
         days_back = 4 if is_crypto else 10
@@ -1041,6 +1064,15 @@ def _get_entry_signal_base(strat, bars, sym, is_crypto):
         if sig and sig['bull']:
             return True, (f"BB+RSI reversal | RSI {sig['rsi_prev']:.1f}->{sig['rsi']:.1f} crossed up 20 "
                           f"| low={sig['low']:.4f} <= lowerBB={sig['lower_bb']:.4f} < close={sig['close']:.4f}"), sig
+    elif strat == 'BTC-W':
+        # Weekend-only 1h BTC strategy: Donchian breakout 20/10 + RSI < 70 filter to avoid
+        # buying late tops. Entry: price > highest high of past 20 1h bars AND RSI(14) < 70.
+        sig = signal_donchian(bars, period=20, exit_period=10)
+        if sig and sig['bull']:
+            rsi_sig = signal_rsi(bars, period=14)
+            if rsi_sig and rsi_sig['rsi'] < 70:
+                return True, (f"1h Donchian breakout | price={sig['price']:.2f} > 20h-high={sig['hh']:.2f} "
+                              f"+ RSI={rsi_sig['rsi']:.1f}<70"), sig
     return False, '', {}
 
 
@@ -1135,6 +1167,11 @@ def _get_exit_signal_base(strat, bars, pos):
         sig = signal_bb_rsi_reversal(bars)
         if sig and sig['bear']:
             return True, f"RSI cross-down 80 (RSI {sig['rsi_prev']:.1f}->{sig['rsi']:.1f})"
+    elif strat == 'BTC-W':
+        # Exit on Donchian 10-bar low breach (trailing trend exit).
+        sig = signal_donchian(bars, period=20, exit_period=10)
+        if sig and sig['bear']:
+            return True, f"1h Donchian 10h-low break (price={sig['price']:.2f} < {sig['ll']:.2f})"
     return False, ''
 
 
@@ -1181,8 +1218,12 @@ def process_exit(strat, state, bars_dict, force_close_stocks, force_close_stocks
     should_exit, reason = False, ''
     skip_force_close = bs in NO_FORCE_CLOSE_STRATS
     skip_atr_stop = bs in NO_ATR_STOP_STRATS
+    # BTC-W: weekend force-close at Sunday 22:00 UTC (before Monday gap risk).
+    now_utc = datetime.now(timezone.utc)
+    if strat == 'BTC-W' and now_utc.weekday() == 6 and (now_utc.hour * 60 + now_utc.minute) >= 22 * 60:
+        should_exit, reason = True, 'BTC-W weekend force-close (Sun 22:00 UTC, pre-Monday gap)'
     # Force-close applies to STOCKS ONLY. 5-min strats: 19:30 UTC. 15-min strats: 23:30 UTC.
-    if (not is_crypto) and fc and not skip_force_close:
+    elif (not is_crypto) and fc and not skip_force_close:
         when = '23:30 UTC (15-min series)' if strat in LONG_TF_STRATS else '19:30 UTC (5-min series)'
         should_exit, reason = True, f'FORCE CLOSE ({when})'
     elif price <= stop and not skip_atr_stop:
@@ -1296,7 +1337,14 @@ def process_entry(strat, state, bars_dict, taken_syms, per_strategy_target,
     if state.get(strat):
         return False  # already holding
 
+    # Weekend-only strategies (e.g. BTC-W) only fire on Sat/Sun UTC.
+    if strat in WEEKEND_ONLY_STRATS:
+        if datetime.now(timezone.utc).weekday() < 5:
+            return False
     for sym, is_crypto in WATCHLIST:
+        # BTC-only strategies skip every stock.
+        if strat in BTC_ONLY_STRATS and not is_crypto:
+            continue
         # No single-symbol lock — multiple strategies may hold the same symbol
         # concurrently (each with its own per-strategy cash slice). Allows full
         # head-to-head comparison: A, A2, and A3 can all trade the same AAPL bar.
@@ -1774,10 +1822,10 @@ def run():
     summary = ' | '.join(f"{s}={state[s] and state[s]['symbol'] or 'flat'}" for s in ALL_STRATS)
     log(f'State: {summary}')
 
-    # bars_dict structure: { sym: { '5Min': [...], '15Min': [...] } }
-    # 15Min bars are only fetched/used if there are LONG_TF strategies in ALL_STRATS.
+    # bars_dict structure: { sym: { '5Min': [...], '15Min': [...], '1Hour': [...] } }
     bars_dict = {}
     have_long_tf = bool(LONG_TF_STRATS)
+    have_hour_tf = bool(HOUR_TF_STRATS)
     for sym, is_crypto in WATCHLIST:
         per_sym = {}
         b5 = get_bars(sym, is_crypto, '5Min')
@@ -1791,6 +1839,14 @@ def run():
                 per_sym['15Min'] = b15
             elif b15:
                 log(f'SKIP {sym} 15Min: only {len(b15)} bars (need >=220)')
+        # 1Hour: only fetch for BTC (the only 1h-timeframe strategy is BTC-W which is BTC-only).
+        if have_hour_tf and is_crypto:
+            b1h = get_bars(sym, is_crypto, '1Hour')
+            # Need ~70 bars for 50-EMA + 20-bar Donchian + ATR convergence
+            if b1h and len(b1h) >= 70:
+                per_sym['1Hour'] = b1h
+            elif b1h:
+                log(f'SKIP {sym} 1Hour: only {len(b1h)} bars (need >=70)')
         if per_sym:
             bars_dict[sym] = per_sym
 
