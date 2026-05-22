@@ -18,6 +18,7 @@ Strategies E, F, I have no separate volume filter (mean-reversion / VWAP-implici
 """
 import json
 import os
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -385,6 +386,43 @@ def get_account():
     except Exception as e:
         log(f'ERROR account: {e}')
         return None
+
+
+def get_open_orders():
+    """Return list of open (not yet filled/cancelled) orders. None on API failure.
+    Each order dict has at minimum: symbol, side, qty, status."""
+    try:
+        r = requests.get(f'{TRADE_BASE}/orders', headers=HEADERS,
+                         params={'status': 'open', 'limit': 500}, timeout=15)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        log(f'ERROR open_orders: {e}')
+        return None
+
+
+def pending_sides_by_symbol(open_orders):
+    """Returns {sym: {'buy_qty': X, 'sell_qty': Y, 'has_buy': bool, 'has_sell': bool}}
+    aggregated across all open orders. Symbol is normalized (BTCUSD -> BTC/USD)."""
+    out = defaultdict(lambda: {'buy_qty': 0.0, 'sell_qty': 0.0, 'has_buy': False, 'has_sell': False})
+    if not open_orders:
+        return out
+    for o in open_orders:
+        sym = o.get('symbol', '')
+        if sym == 'BTCUSD':
+            sym = 'BTC/USD'
+        side = o.get('side', '')
+        try:
+            qty = float(o.get('qty') or 0)
+        except (TypeError, ValueError):
+            qty = 0.0
+        if side == 'buy':
+            out[sym]['buy_qty'] += qty
+            out[sym]['has_buy'] = True
+        elif side == 'sell':
+            out[sym]['sell_qty'] += qty
+            out[sym]['has_sell'] = True
+    return out
 
 
 def get_alpaca_positions():
@@ -1175,7 +1213,7 @@ def _get_exit_signal_base(strat, bars, pos):
     return False, ''
 
 
-def process_exit(strat, state, bars_dict, force_close_stocks, force_close_stocks_long_tf=False):
+def process_exit(strat, state, bars_dict, force_close_stocks, force_close_stocks_long_tf=False, tick_ctx=None):
     pos = state.get(strat)
     if not pos:
         return
@@ -1253,20 +1291,31 @@ def process_exit(strat, state, bars_dict, force_close_stocks, force_close_stocks
                 state[strat] = None
                 return
             qty_avail = float(apos.get('qty_available', 0))
-            if qty_avail <= 1e-9:
-                log(f'[{strat}] EXIT close skipped for {sym}: qty_available=0 (other strategy pending), retry next tick')
+            # Subtract any qty we've already SUBMITTED as SELL this tick (pending-orders
+            # endpoint may not have updated yet). Prevents 'insufficient qty' 403s when
+            # multiple strategies exit the same symbol in one tick.
+            tick_locked = 0.0
+            if tick_ctx is not None:
+                tick_locked = float(tick_ctx['this_tick_sells'].get(sym, 0.0))
+            effective_avail = qty_avail - tick_locked
+            if effective_avail <= 1e-9:
+                log(f'[{strat}] EXIT close skipped for {sym}: qty_available={qty_avail:.9f} - tick_locked={tick_locked:.9f} = 0, retry next tick')
                 return
             # Cap: never exceed our stored share AND never exceed currently-available qty.
-            requested = float(pos['qty']) if pos.get('qty') else qty_avail / same_sym_count
+            requested = float(pos['qty']) if pos.get('qty') else effective_avail / same_sym_count
             # Take 99% of the cap as a safety margin against float / fee dust
-            sell_qty = min(requested, qty_avail) * 0.999
+            sell_qty = min(requested, effective_avail) * 0.999
             sell_qty = round(sell_qty, 9)
             if sell_qty < 1e-8:
                 log(f'[{strat}] EXIT cleared {sym}: sell qty too small ({sell_qty})')
                 state[strat] = None
                 return
-            log(f'[{strat}] partial close {sym}: requested={requested:.9f} avail={qty_avail:.9f} -> sending {sell_qty:.9f}')
+            log(f'[{strat}] partial close {sym}: requested={requested:.9f} avail={effective_avail:.9f} -> sending {sell_qty:.9f}')
             result = close_position(sym, qty=sell_qty)
+            # Track this sell against tick_ctx so subsequent strategies in the same tick
+            # don't try to oversell.
+            if result is not None and tick_ctx is not None:
+                tick_ctx['this_tick_sells'][sym] += sell_qty
         else:
             result = close_position(sym)
         if result is None:
@@ -1352,6 +1401,15 @@ def process_entry(strat, state, bars_dict, taken_syms, per_strategy_target,
         # Skip blacklisted chronic losers (existing positions still exit normally).
         if sym in BLACKLIST:
             continue
+        # Wash-trade prevention: if a SELL is pending on this symbol (either from a
+        # prior tick or another strategy this tick), Alpaca will reject our BUY with
+        # 'potential wash trade detected'. Skip and retry next tick.
+        if tick_ctx is not None:
+            pend = tick_ctx.get('pending', {}).get(sym, {})
+            this_tick_sell = tick_ctx.get('this_tick_sells', {}).get(sym, 0.0)
+            if pend.get('has_sell') or this_tick_sell > 0:
+                log(f'[{strat}] BUY SKIPPED {sym}: pending SELL exists (wash-trade guard)')
+                continue
         # Stocks: blocked outside 13:30–15:30 UTC normal trading. The all-in path bypasses
         # this block during the 15:30–16:00 UTC last-entry window.
         if (not is_crypto) and block_new_stock_entries and not all_in_mode:
@@ -1857,10 +1915,22 @@ def run():
     else:
         claim_orphan_positions(state, bars_dict, alpaca_positions_now)
 
+    # Pre-flight: fetch open orders ONCE per tick. Used by both exits and entries to:
+    #   - Avoid wash-trade rejections on BUY (pending SELL on same symbol)
+    #   - Avoid qty-contention rejections on SELL (pending SELL still locks qty)
+    open_orders = get_open_orders() or []
+    pending = pending_sides_by_symbol(open_orders)
+    tick_ctx = {
+        'committed_cash': 0.0,
+        'pending': pending,
+        'this_tick_sells': defaultdict(float),
+    }
+
     # Exits first
     for s in ALL_STRATS:
         process_exit(s, state, bars_dict, force_close_stocks,
-                     force_close_stocks_long_tf=force_close_stocks_long_tf)
+                     force_close_stocks_long_tf=force_close_stocks_long_tf,
+                     tick_ctx=tick_ctx)
 
     # News/event halt — if active, force-close affected positions and short-circuit entries
     halt_active = process_halt(state, bars_dict)
@@ -1871,7 +1941,7 @@ def run():
     # Entries (skipped entirely when a halt is active)
     # tick_ctx tracks cash committed in this tick so back-to-back buys don't over-spend
     # (Alpaca's account endpoint cash field lags behind rapid order submissions).
-    tick_ctx = {'committed_cash': 0.0}
+    # (tick_ctx initialized above before exits)
     if halt_active:
         log('Entries SKIPPED: trading halt active')
         save_state(state)
