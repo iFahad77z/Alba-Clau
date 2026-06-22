@@ -283,6 +283,49 @@ WATCHLIST = [
 # Existing positions in these symbols still get exit-managed; only NEW entries are blocked.
 BLACKLIST = {'CVX', 'SLB', 'CF'}
 
+# Per-asset whitelist mode: each asset class (5-min stocks, 15-min stocks, crypto)
+# has its own enabled-strategy set. A strategy only opens NEW positions in an asset
+# class if it appears in that class's set. Existing positions exit normally.
+# Set any set to empty to disable filtering for that class.
+#
+# 5-MIN STOCKS — top 5 by balanced (% / $ / sample / WR / signal diversity):
+#   C   — Donchian Breakout 20/10                (+34% / +$258 / 59 trades)
+#   C2  — Donchian + 200 EMA filter              (+27% / +$351 / 52 trades)
+#   B2  — 20/50 EMA Cross + 200 EMA filter       (+30% / +$302 / 23 trades)
+#   D4  — MACD + Swing-Low Stop                  (+16% / +$209 / 32 trades, 59% WR)
+#   I3  — VWAP Reclaim + Trailing Stop           (+11% / +$1,501 / 69 trades)
+STOCK_5MIN_ENABLED = {'C', 'C2', 'B2', 'D4', 'I3'}
+
+# 15-MIN STOCKS — top 7 by WR (per user spec):
+#   E5 (50%), L5 (43%), C5 (38%), J5 (34%), H5 (33%), X-A5 (26%), N5 (21%)
+STOCK_15MIN_ENABLED = {'E5', 'L5', 'C5', 'J5', 'H5', 'X-A5', 'N5'}
+
+# CRYPTO — top 5 by all-time total %, excluding 1-trade X-K3 outlier:
+#   C2 (+1.31% / 14 trades), B4 (+1.23% / 5), A (+1.08% / 31),
+#   E5 (+1.02% / 9), G2 (+0.60% / 11)
+CRYPTO_ENABLED = {'C2', 'B4', 'A', 'E5', 'G2'}
+
+# Per-symbol exposure cap: no single symbol can hold more than this fraction
+# of equity at any time. Defensive measure when running concentrated strategies
+# — without it, multiple enabled strats could pile into one stock for 100% of
+# account in one ticker. 0.30 = max 30% of equity per symbol.
+MAX_SYMBOL_EXPOSURE_PCT = 0.30
+
+
+def strat_allowed_for_asset(strat, is_crypto):
+    """True if `strat` is in the enabled set for the given asset class."""
+    if is_crypto:
+        # Special case: BTC-W is a dedicated BTC strategy with its own rules
+        if strat == 'BTC-W':
+            return True
+        return not CRYPTO_ENABLED or strat in CRYPTO_ENABLED
+    # Stocks: pick the right list based on the strategy's timeframe
+    tf = strategy_timeframe(strat)
+    if tf == '15Min':
+        return not STOCK_15MIN_ENABLED or strat in STOCK_15MIN_ENABLED
+    # default 5-min (1Hour stocks don't exist in our current setup)
+    return not STOCK_5MIN_ENABLED or strat in STOCK_5MIN_ENABLED
+
 
 def log(msg):
     ts = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%SZ')
@@ -1421,8 +1464,9 @@ def process_entry(strat, state, bars_dict, taken_syms, per_strategy_target,
             continue
         if is_crypto and base_strat(strat) in STOCK_ONLY_STRATS:
             continue  # ORB and VWAP don't apply to crypto
-        if is_crypto and base_strat(strat) in NO_BTC_STRATS:
-            continue  # MACD + Volume-EMA strategies have been blacklisted from BTC (poor fit)
+        # Per-asset whitelist: skip if this strategy isn't enabled for this asset class
+        if not strat_allowed_for_asset(strat, is_crypto):
+            continue
         bars = bars_for(bars_dict, sym, strat)
         if not bars:
             continue
@@ -1494,6 +1538,19 @@ def process_entry(strat, state, bars_dict, taken_syms, per_strategy_target,
                 log(f'[{strat}] BUY SCALED DOWN {sym}: avail ${available:.2f} < target, sizing to ${notional:.2f}')
             else:
                 notional = per_strategy_target * CASH_PCT
+
+        # Per-symbol exposure cap: prevent over-concentration when multiple enabled
+        # strategies all fire on the same ticker at the same tick.
+        current_sym_exposure = sum(
+            float(p.get('notional', 0)) for s, p in state.items()
+            if isinstance(p, dict) and p.get('symbol') == sym
+        )
+        equity_now = float(acct.get('equity', acct.get('cash', 100000)))
+        cap = equity_now * MAX_SYMBOL_EXPOSURE_PCT
+        if current_sym_exposure + notional > cap:
+            log(f'[{strat}] BUY SKIPPED {sym}: per-symbol cap ${cap:.2f} would be exceeded '
+                f'(current ${current_sym_exposure:.2f} + new ${notional:.2f})')
+            continue
 
         # Stop calculation: X4 variants use the lowest low of the past SWINGLOW_LOOKBACK
         # bars (chart structure stop). All others use 1.5×ATR (X3 also starts here and
@@ -1874,9 +1931,14 @@ def run():
         save_state(state)
         return
     equity = float(acct['equity'])
-    per_strategy_target = round(equity / len(ALL_STRATS) * CASH_PCT, 2)
-    pct_each = round(100 / len(ALL_STRATS), 2)
-    log(f'Equity: ${equity:.2f} | per-strategy target: ${per_strategy_target:.2f} ({pct_each}% each, {len(ALL_STRATS)} strategies)')
+    # Sizing uses the UNION of enabled strategies (across all asset classes) — each
+    # enabled strategy gets one equal slot. Disabled strategies still manage existing
+    # positions but won't open new ones, so they shouldn't claim a slot.
+    enabled_union = STOCK_5MIN_ENABLED | STOCK_15MIN_ENABLED | CRYPTO_ENABLED | {'BTC-W'}
+    n_enabled = len(enabled_union) if enabled_union else len(ALL_STRATS)
+    per_strategy_target = round(equity / n_enabled * CASH_PCT, 2)
+    pct_each = round(100 / n_enabled, 2)
+    log(f'Equity: ${equity:.2f} | per-strategy target: ${per_strategy_target:.2f} ({pct_each}% each, {n_enabled} enabled / {len(ALL_STRATS)} total)')
     summary = ' | '.join(f"{s}={state[s] and state[s]['symbol'] or 'flat'}" for s in ALL_STRATS)
     log(f'State: {summary}')
 
