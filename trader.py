@@ -305,6 +305,13 @@ STOCK_15MIN_ENABLED = {'E5', 'L5', 'C5', 'J5', 'H5', 'X-A5', 'N5'}
 #   E5 (+1.02% / 9), G2 (+0.60% / 11)
 CRYPTO_ENABLED = {'C2', 'B4', 'A', 'E5', 'G2'}
 
+# Capital pool split: half of equity goes to stock trades, half to crypto trades.
+# Each pool is divided equally among the strategies enabled for that asset class.
+# Overlapping strategies (e.g. C2 trades both) get the stock target when entering
+# stocks and the crypto target when entering crypto.
+STOCK_ALLOCATION_PCT  = 0.5
+CRYPTO_ALLOCATION_PCT = 0.5
+
 # Per-symbol exposure cap: no single symbol can hold more than this fraction
 # of equity at any time. Defensive measure when running concentrated strategies
 # — without it, multiple enabled strats could pile into one stock for 100% of
@@ -1415,7 +1422,8 @@ def process_entry(strat, state, bars_dict, taken_syms, per_strategy_target,
                   block_new_stock_entries, market_open, all_in_mode=False,
                   block_new_btc_entries=False, tick_ctx=None,
                   block_new_stock_entries_long_tf=False,
-                  block_new_btc_entries_long_tf=False):
+                  block_new_btc_entries_long_tf=False,
+                  crypto_per_strategy_target=None):
     """
     Returns True if an entry was placed for this strategy this tick, False otherwise.
     If all_in_mode is True, the entry uses ALL available cash (capped to ~95% of the
@@ -1522,22 +1530,25 @@ def process_entry(strat, state, bars_dict, taken_syms, per_strategy_target,
                 continue
             notional = available * CASH_PCT
         else:
+            # Per-asset target: stocks use stock pool target, crypto uses crypto pool target.
+            asset_target = (crypto_per_strategy_target if (is_crypto and crypto_per_strategy_target)
+                            else per_strategy_target)
             # Sizing logic:
             #   1. If we have ≥95% of the per-strategy target available, use the target.
             #   2. Else if we have at least 50% of target, scale DOWN to fit available
             #      (better to place a smaller order than fail). Helps when daytrading
             #      buying power is partially depleted.
             #   3. Else skip entirely.
-            min_acceptable = per_strategy_target * 0.50
+            min_acceptable = asset_target * 0.50
             if available < min_acceptable:
-                log(f'[{strat}] BUY SKIPPED {sym}: avail ${available:.2f} below 50% of target ${per_strategy_target:.2f} (likely dtbp depleted)')
+                log(f'[{strat}] BUY SKIPPED {sym}: avail ${available:.2f} below 50% of target ${asset_target:.2f} (likely dtbp depleted)')
                 continue
-            elif available < per_strategy_target * 0.95:
+            elif available < asset_target * 0.95:
                 # Scale down to available, with 1% headroom
                 notional = available * 0.99
                 log(f'[{strat}] BUY SCALED DOWN {sym}: avail ${available:.2f} < target, sizing to ${notional:.2f}')
             else:
-                notional = per_strategy_target * CASH_PCT
+                notional = asset_target * CASH_PCT
 
         # Per-symbol exposure cap: prevent over-concentration when multiple enabled
         # strategies all fire on the same ticker at the same tick.
@@ -1897,10 +1908,8 @@ def run():
     # (only the all-in entry path can fire during the window). After 16:00 UTC, stock entries
     # remain blocked all the way until the next 13:30 UTC.
     block_new_stock_entries = (not market_open) or utc_min >= last_entry_window_start
-    # BTC time-of-day rule (5-min series): blocked during stock-trading hours (13:30–19:30
-    # UTC weekdays). Allowed from 19:30 UTC (force-close) through next 13:30 UTC, plus weekends.
-    btc_active_window = is_weekend or utc_min >= force_close_at_min or utc_min < market_open_min
-    block_new_btc_entries = not btc_active_window
+    # BTC trades 24/7 (per user policy) — no time-of-day restrictions for any crypto entry.
+    block_new_btc_entries = False
     # Force-close (5-min series) fires 19:30–20:00 UTC weekdays.
     force_close_stocks = (not is_weekend) and force_close_at_min <= utc_min < (force_close_at_min + 30)
 
@@ -1913,8 +1922,8 @@ def run():
     long_tf_after_market_end_min = 24 * 60   # 24:00 UTC (after-market close in EDT)
     long_tf_market_open = (not is_weekend) and long_tf_pre_market_min <= utc_min < long_tf_after_market_end_min
     block_new_stock_entries_long_tf = (not long_tf_market_open) or utc_min >= long_tf_force_close_min
-    btc_active_window_long_tf = is_weekend or utc_min >= long_tf_force_close_min or utc_min < long_tf_pre_market_min
-    block_new_btc_entries_long_tf = not btc_active_window_long_tf
+    # BTC trades 24/7 — no time gate for 15-min strategies either.
+    block_new_btc_entries_long_tf = False
     # NOTE: 15-min strategies have NO force-close. Positions run until signal/stop fires.
     # We still gate new ENTRIES at long_tf_force_close_min (23:30 UTC) so the bot doesn't
     # open fresh stock positions in the last 30 min before after-market close.
@@ -1931,14 +1940,20 @@ def run():
         save_state(state)
         return
     equity = float(acct['equity'])
-    # Sizing uses the UNION of enabled strategies (across all asset classes) — each
-    # enabled strategy gets one equal slot. Disabled strategies still manage existing
-    # positions but won't open new ones, so they shouldn't claim a slot.
-    enabled_union = STOCK_5MIN_ENABLED | STOCK_15MIN_ENABLED | CRYPTO_ENABLED | {'BTC-W'}
-    n_enabled = len(enabled_union) if enabled_union else len(ALL_STRATS)
-    per_strategy_target = round(equity / n_enabled * CASH_PCT, 2)
-    pct_each = round(100 / n_enabled, 2)
-    log(f'Equity: ${equity:.2f} | per-strategy target: ${per_strategy_target:.2f} ({pct_each}% each, {n_enabled} enabled / {len(ALL_STRATS)} total)')
+    # Capital split: half for stocks, half for crypto. Each pool divided equally
+    # among the strategies enabled for that asset class.
+    stock_pool  = equity * STOCK_ALLOCATION_PCT
+    crypto_pool = equity * CRYPTO_ALLOCATION_PCT
+    stock_strats_enabled  = STOCK_5MIN_ENABLED | STOCK_15MIN_ENABLED
+    crypto_strats_enabled = CRYPTO_ENABLED | {'BTC-W'}
+    n_stock  = len(stock_strats_enabled)  if stock_strats_enabled  else 1
+    n_crypto = len(crypto_strats_enabled) if crypto_strats_enabled else 1
+    stock_per_strategy_target  = round(stock_pool  / n_stock  * CASH_PCT, 2)
+    crypto_per_strategy_target = round(crypto_pool / n_crypto * CASH_PCT, 2)
+    # Legacy single variable retained for compatibility with paths that still take one target
+    # (e.g. all-in mode). Defaults to stocks pool since all-in is a stock-window concept.
+    per_strategy_target = stock_per_strategy_target
+    log(f'Equity: ${equity:.2f} | Stocks: ${stock_per_strategy_target:.2f}/slot × {n_stock} = ${stock_pool:.0f} pool | Crypto: ${crypto_per_strategy_target:.2f}/slot × {n_crypto} = ${crypto_pool:.0f} pool')
     summary = ' | '.join(f"{s}={state[s] and state[s]['symbol'] or 'flat'}" for s in ALL_STRATS)
     log(f'State: {summary}')
 
@@ -2017,7 +2032,8 @@ def run():
                                    block_new_btc_entries=block_new_btc_entries,
                                    tick_ctx=tick_ctx,
                                    block_new_stock_entries_long_tf=block_new_stock_entries_long_tf,
-                                   block_new_btc_entries_long_tf=block_new_btc_entries_long_tf)
+                                   block_new_btc_entries_long_tf=block_new_btc_entries_long_tf,
+                                   crypto_per_strategy_target=crypto_per_strategy_target)
             if placed:
                 log(f'[ALL-IN WINDOW] [{s}] consumed available cash; halting further entries this tick')
                 break
@@ -2028,7 +2044,8 @@ def run():
                           block_new_btc_entries=block_new_btc_entries,
                           tick_ctx=tick_ctx,
                           block_new_stock_entries_long_tf=block_new_stock_entries_long_tf,
-                          block_new_btc_entries_long_tf=block_new_btc_entries_long_tf)
+                          block_new_btc_entries_long_tf=block_new_btc_entries_long_tf,
+                          crypto_per_strategy_target=crypto_per_strategy_target)
 
     # Morning summary: 07:00 UTC every day (overnight recap, focuses on BTC since stocks closed)
     maybe_send_morning_summary(state, utc_min, now_utc.hour, equity, is_weekend)
